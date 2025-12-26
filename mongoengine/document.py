@@ -31,6 +31,7 @@ from mongoengine.errors import (
     InvalidQueryError,
     SaveConditionError,
 )
+from mongoengine.io.sync.operations import SyncIOOperations
 from mongoengine.pymongo_support import list_collection_names
 from mongoengine.queryset import (
     NotUniqueError,
@@ -179,6 +180,9 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
     my_metaclass = TopLevelDocumentMetaclass
 
     __slots__ = ("__objects",)
+
+    # I/O operations layer - can be swapped for async version
+    _io = SyncIOOperations
 
     @property
     def pk(self):
@@ -507,20 +511,20 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         collection = self._get_collection()
         with set_write_concern(collection, write_concern) as wc_collection:
             if force_insert:
-                return wc_collection.insert_one(doc, session=_get_session()).inserted_id
+                return self._io.insert_one(wc_collection, doc, session=_get_session()).inserted_id
             # insert_one will provoke UniqueError alongside save does not
             # therefore, it need to catch and call replace_one.
             if "_id" in doc:
                 select_dict = {"_id": doc["_id"]}
                 select_dict = self._integrate_shard_key(doc, select_dict)
-                raw_object = wc_collection.find_one_and_replace(
-                    select_dict, doc, session=_get_session()
+                raw_object = self._io.find_one_and_replace(
+                    wc_collection, select_dict, doc, session=_get_session()
                 )
                 if raw_object:
                     return doc["_id"]
 
-            object_id = wc_collection.insert_one(
-                doc, session=_get_session()
+            object_id = self._io.insert_one(
+                wc_collection, doc, session=_get_session()
             ).inserted_id
 
         return object_id
@@ -578,8 +582,8 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         if update_doc:
             upsert = save_condition is None
             with set_write_concern(collection, write_concern) as wc_collection:
-                last_error = wc_collection.update_one(
-                    select_dict, update_doc, upsert=upsert, session=_get_session()
+                last_error = self._io.update_one(
+                    wc_collection, select_dict, update_doc, upsert=upsert, session=_get_session()
                 ).raw_result
             if not upsert and last_error["n"] == 0:
                 raise SaveConditionError(

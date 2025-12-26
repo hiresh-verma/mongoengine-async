@@ -22,6 +22,7 @@ from mongoengine.context_managers import (
     set_write_concern,
     switch_db,
 )
+from mongoengine.io.sync.operations import SyncIOOperations
 from mongoengine.errors import (
     BulkWriteError,
     InvalidQueryError,
@@ -51,6 +52,9 @@ class BaseQuerySet:
     """A set of results returned from a query. Wraps a MongoDB cursor,
     providing :class:`~mongoengine.Document` objects as the results.
     """
+
+    # I/O operations layer - can be swapped for async version
+    _io = SyncIOOperations
 
     def __init__(self, document, collection):
         self._document = document
@@ -351,13 +355,17 @@ class BaseQuerySet:
         raw = [doc.to_mongo() for doc in docs]
 
         with set_write_concern(self._collection, write_concern) as collection:
-            insert_func = collection.insert_many
-            if return_one:
-                raw = raw[0]
-                insert_func = collection.insert_one
+            pass
 
         try:
-            inserted_result = insert_func(raw, session=_get_session())
+            if return_one:
+                inserted_result = self._io.insert_one(
+                    collection, raw[0], session=_get_session()
+                )
+            else:
+                inserted_result = self._io.insert_many(
+                    collection, raw, session=_get_session()
+                )
             ids = (
                 [inserted_result.inserted_id]
                 if return_one
@@ -528,7 +536,8 @@ class BaseQuerySet:
             kwargs["comment"] = self._comment
 
         with set_write_concern(queryset._collection, write_concern) as collection:
-            result = collection.delete_many(
+            result = self._io.delete_many(
+                collection,
                 queryset._query,
                 session=_get_session(),
                 **kwargs,
@@ -607,17 +616,26 @@ class BaseQuerySet:
             with set_read_write_concern(
                 queryset._collection, write_concern, read_concern
             ) as collection:
-                update_func = collection.update_one
                 if multi:
-                    update_func = collection.update_many
-                result = update_func(
-                    query,
-                    update,
-                    upsert=upsert,
-                    array_filters=array_filters,
-                    session=_get_session(),
-                    **kwargs,
-                )
+                    result = self._io.update_many(
+                        collection,
+                        query,
+                        update,
+                        upsert=upsert,
+                        session=_get_session(),
+                        array_filters=array_filters,
+                        **kwargs,
+                    )
+                else:
+                    result = self._io.update_one(
+                        collection,
+                        query,
+                        update,
+                        upsert=upsert,
+                        session=_get_session(),
+                        array_filters=array_filters,
+                        **kwargs,
+                    )
             if full_result:
                 return result
             elif result.raw_result:
@@ -738,15 +756,20 @@ class BaseQuerySet:
 
         try:
             if remove:
-                result = queryset._collection.find_one_and_delete(
-                    query, sort=sort, session=_get_session(), **self._cursor_args
+                result = self._io.find_one_and_delete(
+                    queryset._collection,
+                    query,
+                    sort=sort,
+                    session=_get_session(),
+                    **self._cursor_args,
                 )
             else:
                 if new:
                     return_doc = ReturnDocument.AFTER
                 else:
                     return_doc = ReturnDocument.BEFORE
-                result = queryset._collection.find_one_and_update(
+                result = self._io.find_one_and_update(
+                    queryset._collection,
                     query,
                     update,
                     upsert=upsert,
@@ -788,8 +811,11 @@ class BaseQuerySet:
         """
         doc_map = {}
 
-        docs = self._collection.find(
-            {"_id": {"$in": object_ids}}, session=_get_session(), **self._cursor_args
+        docs = self._io.find(
+            self._collection,
+            {"_id": {"$in": object_ids}},
+            session=_get_session(),
+            **self._cursor_args,
         )
         if self._scalar:
             for doc in docs:
@@ -1420,7 +1446,8 @@ class BaseQuerySet:
         if self._comment:
             kwargs.setdefault("comment", self._comment)
 
-        return collection.aggregate(
+        return self._io.aggregate(
+            collection,
             final_pipeline,
             cursor={},
             session=_get_session(),
@@ -1524,7 +1551,8 @@ class BaseQuerySet:
                 mr_args["out"] = SON(ordered_output)
 
         db = queryset._document._get_db()
-        result = db.command(
+        result = self._io.command(
+            db,
             {
                 "mapReduce": queryset._document._get_collection_name(),
                 "map": map_f,
@@ -1538,10 +1566,10 @@ class BaseQuerySet:
             docs = result["results"]
         else:
             if isinstance(result["result"], str):
-                docs = db[result["result"]].find()
+                docs = self._io.find(db[result["result"]], {})
             else:
                 info = result["result"]
-                docs = db.client[info["db"]][info["collection"]].find()
+                docs = self._io.find(db.client[info["db"]][info["collection"]], {})
 
         if queryset._ordering:
             docs = docs.sort(queryset._ordering)
@@ -1627,7 +1655,9 @@ class BaseQuerySet:
             pipeline.insert(1, {"$unwind": "$" + field})
 
         result = tuple(
-            self._document._get_collection().aggregate(pipeline, session=_get_session())
+            self._io.aggregate(
+                self._document._get_collection(), pipeline, session=_get_session()
+            )
         )
 
         if result:
@@ -1656,7 +1686,9 @@ class BaseQuerySet:
             pipeline.insert(1, {"$unwind": "$" + field})
 
         result = tuple(
-            self._document._get_collection().aggregate(pipeline, session=_get_session())
+            self._io.aggregate(
+                self._document._get_collection(), pipeline, session=_get_session()
+            )
         )
         if result:
             return result[0]["total"]
@@ -1762,12 +1794,15 @@ class BaseQuerySet:
         # level, not a cursor level. Thus, we need to get a cloned collection
         # object using `with_options` first.
         if self._read_preference is not None or self._read_concern is not None:
-            self._cursor_obj = self._collection.with_options(
+            collection = self._collection.with_options(
                 read_preference=self._read_preference, read_concern=self._read_concern
-            ).find(self._query, session=_get_session(), **self._cursor_args)
+            )
+            self._cursor_obj = self._io.find(
+                collection, self._query, session=_get_session(), **self._cursor_args
+            )
         else:
-            self._cursor_obj = self._collection.find(
-                self._query, session=_get_session(), **self._cursor_args
+            self._cursor_obj = self._io.find(
+                self._collection, self._query, session=_get_session(), **self._cursor_args
             )
 
         # Apply "where" clauses to cursor
