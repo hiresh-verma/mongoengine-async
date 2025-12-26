@@ -16,7 +16,6 @@ from mongoengine.fields import StringField, IntField
 from mongoengine.io.aio.connection import (
     async_connect,
     async_disconnect_all,
-    async_register_connection,
 )
 
 
@@ -38,7 +37,7 @@ async def async_db():
     Tests will skip gracefully on standalone MongoDB.
     """
     await async_disconnect_all()
-    await async_connect("mongoenginetest_async", host="localhost", port=27017, port=27017)
+    await async_connect("mongoenginetest_async", host="localhost", port=27017)
 
     # Clean up collections (both default and any alternate collections)
     try:
@@ -66,7 +65,7 @@ async def async_multi_db():
         await async_connect(
             "mongoenginetest_async",
             alias="default",
-            host="localhost", port=27017,
+            host="localhost",
             port=27017,
         )
 
@@ -74,13 +73,18 @@ async def async_multi_db():
         await async_connect(
             "mongoenginetest_async2",
             alias="testdb2",
-            host="localhost", port=27017,
+            host="localhost",
             port=27017,
         )
 
-        # Clean up collections in default db
-        db = await AsyncUser._get_async_db()
-        await db["async_test_transaction_users"].delete_many({})
+        # Clean up collections in both databases
+        from mongoengine.io.aio.connection import async_get_db
+
+        db_default = await async_get_db(alias="default")
+        await db_default["async_test_transaction_users"].delete_many({})
+
+        db_testdb2 = await async_get_db(alias="testdb2")
+        await db_testdb2["async_test_transaction_users"].delete_many({})
     except Exception as e:
         print(f"Setup error: {e}")
 
@@ -273,6 +277,242 @@ async def test_switch_collection_restores_original(async_db):
 
     # Verify restored
     assert AsyncUser._meta.get("collection") == original_collection
+
+
+# Transaction Edge Cases
+
+
+@pytest.mark.asyncio
+async def test_nested_transactions(async_db):
+    """Test nested transactions (should use same session).
+
+    Note: Requires MongoDB replica set or sharded cluster.
+    """
+    try:
+        async with async_run_in_transaction():
+            user1 = AsyncUser(name="Outer", email="outer@example.com")
+            await user1.save()
+
+            # Nested transaction - uses same session
+            async with async_run_in_transaction():
+                user2 = AsyncUser(name="Inner", email="inner@example.com")
+                await user2.save()
+
+            # Both should be in same transaction
+            count = await AsyncUser.objects.count()
+            assert count == 2
+
+        # Verify both committed
+        users = await AsyncUser.objects.to_list()
+        assert len(users) == 2
+        assert {u.name for u in users} == {"Outer", "Inner"}
+    except OperationFailure as e:
+        if "Transaction numbers are only allowed" in str(e):
+            pytest.skip("Transactions require MongoDB replica set or sharded cluster")
+        raise
+
+
+@pytest.mark.asyncio
+async def test_nested_transaction_rollback(async_db):
+    """Test nested transaction rollback rolls back everything.
+
+    Note: Requires MongoDB replica set or sharded cluster.
+    """
+    try:
+        with pytest.raises(ValueError):
+            async with async_run_in_transaction():
+                user1 = AsyncUser(name="Outer", email="outer@example.com")
+                await user1.save()
+
+                async with async_run_in_transaction():
+                    user2 = AsyncUser(name="Inner", email="inner@example.com")
+                    await user2.save()
+
+                    # Raise error in inner transaction
+                    raise ValueError("Inner error")
+
+        # Both should be rolled back
+        users = await AsyncUser.objects.to_list()
+        assert len(users) == 0
+    except OperationFailure as e:
+        if "Transaction numbers are only allowed" in str(e):
+            pytest.skip("Transactions require MongoDB replica set or sharded cluster")
+        raise
+
+
+@pytest.mark.asyncio
+async def test_transaction_with_validation_error(async_db):
+    """Test transaction rollback on validation error.
+
+    Note: Requires MongoDB replica set or sharded cluster.
+    """
+    try:
+        with pytest.raises(Exception):  # ValidationError
+            async with async_run_in_transaction():
+                user1 = AsyncUser(name="Valid", email="valid@example.com")
+                await user1.save()
+
+                # This should fail validation (missing required name)
+                user2 = AsyncUser(email="invalid@example.com")
+                await user2.save()
+
+        # First user should be rolled back due to second save failing
+        users = await AsyncUser.objects.to_list()
+        assert len(users) == 0
+    except OperationFailure as e:
+        if "Transaction numbers are only allowed" in str(e):
+            pytest.skip("Transactions require MongoDB replica set or sharded cluster")
+        raise
+
+
+@pytest.mark.asyncio
+async def test_sequential_transactions(async_db):
+    """Test multiple sequential transactions.
+
+    Note: Requires MongoDB replica set or sharded cluster.
+    """
+    try:
+        # First transaction
+        async with async_run_in_transaction():
+            user1 = AsyncUser(name="Transaction1", email="tx1@example.com")
+            await user1.save()
+
+        # Second transaction
+        async with async_run_in_transaction():
+            user2 = AsyncUser(name="Transaction2", email="tx2@example.com")
+            await user2.save()
+
+        # Third transaction
+        async with async_run_in_transaction():
+            user3 = AsyncUser(name="Transaction3", email="tx3@example.com")
+            await user3.save()
+
+        # All should be committed
+        users = await AsyncUser.objects.to_list()
+        assert len(users) == 3
+        assert {u.name for u in users} == {
+            "Transaction1",
+            "Transaction2",
+            "Transaction3",
+        }
+    except OperationFailure as e:
+        if "Transaction numbers are only allowed" in str(e):
+            pytest.skip("Transactions require MongoDB replica set or sharded cluster")
+        raise
+
+
+@pytest.mark.asyncio
+async def test_transaction_with_custom_session_kwargs(async_db):
+    """Test transaction with custom session kwargs.
+
+    Note: Requires MongoDB replica set or sharded cluster.
+    """
+    try:
+        # Use custom session options
+        session_kwargs = {"causal_consistency": True}
+
+        async with async_run_in_transaction(session_kwargs=session_kwargs):
+            user = AsyncUser(name="CustomSession", email="custom@example.com")
+            await user.save()
+
+        # Verify saved
+        users = await AsyncUser.objects.to_list()
+        assert len(users) == 1
+        assert users[0].name == "CustomSession"
+    except OperationFailure as e:
+        if "Transaction numbers are only allowed" in str(e):
+            pytest.skip("Transactions require MongoDB replica set or sharded cluster")
+        raise
+
+
+@pytest.mark.asyncio
+async def test_transaction_bulk_operations(async_db):
+    """Test transaction with bulk operations.
+
+    Note: Requires MongoDB replica set or sharded cluster.
+    """
+    try:
+        async with async_run_in_transaction():
+            # Create multiple users
+            for i in range(10):
+                user = AsyncUser(name=f"BulkUser{i}", email=f"bulk{i}@example.com")
+                await user.save()
+
+        # Verify all saved
+        count = await AsyncUser.objects.count()
+        assert count == 10
+    except OperationFailure as e:
+        if "Transaction numbers are only allowed" in str(e):
+            pytest.skip("Transactions require MongoDB replica set or sharded cluster")
+        raise
+
+
+@pytest.mark.asyncio
+async def test_transaction_rollback_bulk_operations(async_db):
+    """Test transaction rollback with bulk operations.
+
+    Note: Requires MongoDB replica set or sharded cluster.
+    """
+    try:
+        with pytest.raises(ValueError):
+            async with async_run_in_transaction():
+                # Create multiple users
+                for i in range(10):
+                    user = AsyncUser(name=f"BulkUser{i}", email=f"bulk{i}@example.com")
+                    await user.save()
+
+                # Raise error after creating all
+                raise ValueError("Rollback bulk")
+
+        # All should be rolled back
+        count = await AsyncUser.objects.count()
+        assert count == 0
+    except OperationFailure as e:
+        if "Transaction numbers are only allowed" in str(e):
+            pytest.skip("Transactions require MongoDB replica set or sharded cluster")
+        raise
+
+
+@pytest.mark.asyncio
+async def test_transaction_mixed_operations(async_db):
+    """Test transaction with mixed create, update, delete operations.
+
+    Note: Requires MongoDB replica set or sharded cluster.
+    """
+    try:
+        # Create some users outside transaction
+        user1 = AsyncUser(name="PreExisting1", email="pre1@example.com", age=20)
+        await user1.save()
+        user2 = AsyncUser(name="PreExisting2", email="pre2@example.com", age=30)
+        await user2.save()
+
+        async with async_run_in_transaction():
+            # Create new user
+            new_user = AsyncUser(name="New", email="new@example.com")
+            await new_user.save()
+
+            # Update existing user
+            user1_update = await AsyncUser.objects.get(pk=user1.pk)
+            user1_update.age = 25
+            await user1_update.save()
+
+            # Delete existing user
+            await AsyncUser.objects.filter(pk=user2.pk).delete()
+
+        # Verify all operations committed
+        users = await AsyncUser.objects.to_list()
+        assert len(users) == 2  # user1 (updated) + new_user, user2 deleted
+
+        names = {u.name for u in users}
+        assert names == {"PreExisting1", "New"}
+
+        # Verify update
+        user1_final = await AsyncUser.objects.get(pk=user1.pk)
+        assert user1_final.age == 25
+    except OperationFailure as e:
+        if "Transaction numbers are only allowed" in str(e):
+            pytest.skip("Transactions require MongoDB replica set or sharded cluster")
+        raise
 
 
 if __name__ == "__main__":
