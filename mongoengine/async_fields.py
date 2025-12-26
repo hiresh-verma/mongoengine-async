@@ -5,6 +5,9 @@ This module provides async versions of reference fields that require
 explicit dereferencing instead of automatic lazy loading.
 """
 
+from typing import Any, List, Optional, Type, Union
+from inspect import isclass
+
 from bson import DBRef, ObjectId
 from mongoengine.base.fields import BaseField
 from mongoengine.base.document import BaseDocument
@@ -13,10 +16,13 @@ from mongoengine.fields import DO_NOTHING, RECURSIVE_REFERENCE_CONSTANT
 from mongoengine.base.common import _DocumentRegistry
 from mongoengine.errors import DoesNotExist
 from mongoengine.io.aio.connection import _get_async_session
-from inspect import isclass
 
 
-__all__ = ['AsyncReferenceField', 'AsyncCachedReferenceField', 'AsyncGenericReferenceField']
+__all__ = [
+    "AsyncReferenceField",
+    "AsyncCachedReferenceField",
+    "AsyncGenericReferenceField",
+]
 
 
 class AsyncReferenceField(BaseField):
@@ -51,16 +57,19 @@ class AsyncReferenceField(BaseField):
     """
 
     def __init__(
-        self, document_type, dbref=False, reverse_delete_rule=DO_NOTHING, **kwargs
-    ):
-        """
-        Initialize the Async Reference Field.
+        self,
+        document_type: Union[str, Type[BaseDocument]],
+        dbref: bool = False,
+        reverse_delete_rule: int = DO_NOTHING,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize the Async Reference Field.
 
         Args:
-            document_type: The type of Document that will be referenced
-            dbref: Store the reference as DBRef or as ObjectId
-            reverse_delete_rule: Determines what to do when the referring object is deleted
-            **kwargs: Keyword arguments passed to parent BaseField
+            document_type: The type of Document that will be referenced.
+            dbref: Store the reference as DBRef or as ObjectId.
+            reverse_delete_rule: Determines what to do when the referring object is deleted.
+            **kwargs: Keyword arguments passed to parent BaseField.
         """
         if not (
             isinstance(document_type, str)
@@ -79,8 +88,12 @@ class AsyncReferenceField(BaseField):
         self.set_auto_dereferencing(False)
 
     @property
-    def document_type(self):
-        """Get the actual document class (resolve string references)."""
+    def document_type(self) -> Type[BaseDocument]:
+        """Get the actual document class (resolve string references).
+
+        Returns:
+            The resolved document class.
+        """
         if isinstance(self.document_type_obj, str):
             if self.document_type_obj == RECURSIVE_REFERENCE_CONSTANT:
                 self.document_type_obj = self.owner_document
@@ -89,25 +102,23 @@ class AsyncReferenceField(BaseField):
         return self.document_type_obj
 
     @staticmethod
-    async def _async_lazy_load_ref(ref_cls, dbref):
-        """
-        Async dereference a DBRef to get the referenced document.
+    async def _async_lazy_load_ref(
+        ref_cls: Type[BaseDocument], dbref: DBRef
+    ) -> BaseDocument:
+        """Async dereference a DBRef to get the referenced document.
 
         Args:
-            ref_cls: The document class to dereference to
-            dbref: The DBRef to dereference
+            ref_cls: The document class to dereference to.
+            dbref: The DBRef to dereference.
 
         Returns:
-            The dereferenced document instance
+            The dereferenced document instance.
 
         Raises:
-            DoesNotExist: If the referenced document doesn't exist
+            DoesNotExist: If the referenced document doesn't exist.
         """
-        # Get the async database
         db = await ref_cls._get_async_db()
 
-        # Manually dereference using async operations
-        # PyMongo's db.dereference() is sync, so we do it manually
         collection = db[dbref.collection]
         dereferenced_son = await collection.find_one(
             {"_id": dbref.id}, session=_get_async_session()
@@ -118,18 +129,17 @@ class AsyncReferenceField(BaseField):
 
         return ref_cls._from_son(dereferenced_son)
 
-    async def fetch(self, instance):
-        """
-        Explicitly fetch the referenced document asynchronously.
+    async def fetch(self, instance: BaseDocument) -> Optional[BaseDocument]:
+        """Explicitly fetch the referenced document asynchronously.
 
         This method must be called to dereference the reference and get
         the actual document object.
 
         Args:
-            instance: The document instance that owns this field
+            instance: The document instance that owns this field.
 
         Returns:
-            The dereferenced document, or None if the reference is None
+            The dereferenced document, or None if the reference is None.
 
         Example:
             post = await Post.objects.first()
@@ -162,8 +172,7 @@ class AsyncReferenceField(BaseField):
         # Handle ObjectId reference (need to create DBRef first)
         if isinstance(ref_value, ObjectId):
             dbref = DBRef(
-                collection=self.document_type._get_collection_name(),
-                id=ref_value
+                collection=self.document_type._get_collection_name(), id=ref_value
             )
             doc = await self._async_lazy_load_ref(self.document_type, dbref)
             # Cache the dereferenced document
@@ -176,29 +185,34 @@ class AsyncReferenceField(BaseField):
 
         return None
 
-    def __get__(self, instance, owner):
-        """
-        Descriptor that returns the raw reference (ObjectId/DBRef).
+    def __get__(self, instance: Optional[BaseDocument], owner: Type) -> Any:
+        """Descriptor that returns the raw reference (ObjectId/DBRef).
 
         Unlike sync ReferenceField, this does NOT auto-dereference.
         Use await field.fetch(instance) to dereference.
-        """
-        if instance is None:
-            # Document class being used rather than a document object
-            return self
-
-        # Return raw reference value without dereferencing
-        return instance._data.get(self.name)
-
-    def to_mongo(self, document):
-        """
-        Convert the document reference to MongoDB format.
 
         Args:
-            document: The document to convert (can be a Document, DBRef, or ObjectId)
+            instance: The document instance.
+            owner: The document class.
 
         Returns:
-            DBRef or ObjectId suitable for MongoDB storage
+            The field instance if called on class, otherwise the raw reference value.
+        """
+        if instance is None:
+            return self
+
+        return instance._data.get(self.name)
+
+    def to_mongo(
+        self, document: Union[BaseDocument, DBRef, ObjectId, None]
+    ) -> Union[DBRef, ObjectId, None]:
+        """Convert the document reference to MongoDB format.
+
+        Args:
+            document: The document to convert (can be a Document, DBRef, or ObjectId).
+
+        Returns:
+            DBRef or ObjectId suitable for MongoDB storage.
         """
         if isinstance(document, DBRef):
             if not self.dbref:
@@ -210,7 +224,9 @@ class AsyncReferenceField(BaseField):
             id_ = document.pk
 
             if id_ is None:
-                self.error("You can only reference documents once they have been saved to the database")
+                self.error(
+                    "You can only reference documents once they have been saved to the database"
+                )
 
             collection = document._get_collection_name()
             if self.dbref:
@@ -220,7 +236,7 @@ class AsyncReferenceField(BaseField):
                         collection,
                         id_,
                         document._class_name,
-                        database=document._get_db().name
+                        database=document._get_db().name,
                     )
                 else:
                     return DBRef(collection, id_, database=document._get_db().name)
@@ -234,15 +250,14 @@ class AsyncReferenceField(BaseField):
 
         return document
 
-    def to_python(self, value):
-        """
-        Convert MongoDB value to Python.
+    def to_python(self, value: Any) -> Union[BaseDocument, DBRef, ObjectId, None]:
+        """Convert MongoDB value to Python.
 
         Args:
-            value: The value from MongoDB (ObjectId, DBRef, or dict)
+            value: The value from MongoDB (ObjectId, DBRef, or dict).
 
         Returns:
-            The Python representation (ObjectId, DBRef, or Document)
+            The Python representation (ObjectId, DBRef, or Document).
         """
         # If it's already a document, return it
         if isinstance(value, BaseDocument):
@@ -260,21 +275,16 @@ class AsyncReferenceField(BaseField):
         if isinstance(value, dict):
             if "$ref" in value:
                 # It's a DBRef in dict form
-                return DBRef(
-                    value["$ref"],
-                    value["$id"],
-                    value.get("$db")
-                )
+                return DBRef(value["$ref"], value["$id"], value.get("$db"))
 
         return value
 
-    def validate(self, value, clean=True):
-        """
-        Validate the reference field value.
+    def validate(self, value: Any, clean: bool = True) -> None:
+        """Validate the reference field value.
 
         Args:
-            value: The value to validate
-            clean: Whether to call clean before validation
+            value: The value to validate.
+            clean: Whether to call clean before validation.
         """
         if value is None:
             if self.required:
@@ -319,13 +329,12 @@ class AsyncGenericReferenceField(BaseField):
         target_doc = await Comment.target.fetch(comment1)
     """
 
-    def __init__(self, *args, **kwargs):
-        """
-        Initialize the Async Generic Reference Field.
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the Async Generic Reference Field.
 
         Args:
-            choices: Optional list of allowed Document types
-            **kwargs: Keyword arguments passed to parent BaseField
+            choices: Optional list of allowed Document types.
+            **kwargs: Keyword arguments passed to parent BaseField.
         """
         choices = kwargs.pop("choices", None)
         super().__init__(*args, **kwargs)
@@ -345,26 +354,33 @@ class AsyncGenericReferenceField(BaseField):
                         "Document subclasses and/or str"
                     )
 
-    def _validate_choices(self, value):
-        """Validate that the value is one of the allowed choices."""
+    def _validate_choices(self, value: Any) -> None:
+        """Validate that the value is one of the allowed choices.
+
+        Args:
+            value: The value to validate.
+        """
         if isinstance(value, dict):
-            # If the field has not been dereferenced, it is still a dict
             value = value.get("_cls")
         elif isinstance(value, BaseDocument):
             value = value._class_name
         super()._validate_choices(value)
 
     @staticmethod
-    async def _async_lazy_load_ref(ref_cls, dbref):
-        """
-        Async dereference a DBRef to get the referenced document.
+    async def _async_lazy_load_ref(
+        ref_cls: Type[BaseDocument], dbref: DBRef
+    ) -> BaseDocument:
+        """Async dereference a DBRef to get the referenced document.
 
         Args:
-            ref_cls: The document class to dereference to
-            dbref: The DBRef to dereference
+            ref_cls: The document class to dereference to.
+            dbref: The DBRef to dereference.
 
         Returns:
-            The dereferenced document instance
+            The dereferenced document instance.
+
+        Raises:
+            DoesNotExist: If the referenced document doesn't exist.
         """
         db = await ref_cls._get_async_db()
         collection = db[dbref.collection]
@@ -378,15 +394,14 @@ class AsyncGenericReferenceField(BaseField):
 
         return ref_cls._from_son(dereferenced_son)
 
-    async def fetch(self, instance):
-        """
-        Explicitly fetch the referenced document asynchronously.
+    async def fetch(self, instance: BaseDocument) -> Optional[BaseDocument]:
+        """Explicitly fetch the referenced document asynchronously.
 
         Args:
-            instance: The document instance that owns this field
+            instance: The document instance that owns this field.
 
         Returns:
-            The dereferenced document of the appropriate type, or None
+            The dereferenced document of the appropriate type, or None.
         """
         value = instance._data.get(self.name)
 
@@ -408,15 +423,27 @@ class AsyncGenericReferenceField(BaseField):
 
         return None
 
-    def __get__(self, instance, owner):
-        """Return the raw reference value (dict with _cls and _ref)."""
+    def __get__(self, instance: Optional[BaseDocument], owner: Type) -> Any:
+        """Return the raw reference value (dict with _cls and _ref).
+
+        Args:
+            instance: The document instance.
+            owner: The document class.
+
+        Returns:
+            The field instance if called on class, otherwise the raw reference value.
+        """
         if instance is None:
             return self
 
         return instance._data.get(self.name)
 
-    def validate(self, value):
-        """Validate the generic reference field value."""
+    def validate(self, value: Any) -> None:
+        """Validate the generic reference field value.
+
+        Args:
+            value: The value to validate.
+        """
         from bson.son import SON
 
         if not isinstance(value, (BaseDocument, DBRef, dict, SON)):
@@ -430,12 +457,14 @@ class AsyncGenericReferenceField(BaseField):
         elif isinstance(value, BaseDocument) and value.id is None:
             self.error("You can only reference documents once they have been saved")
 
-    def to_mongo(self, document):
-        """
-        Convert the document reference to MongoDB format.
+    def to_mongo(self, document: Any) -> Any:
+        """Convert the document reference to MongoDB format.
+
+        Args:
+            document: The document to convert.
 
         Returns:
-            Dict with "_cls" (class name) and "_ref" (DBRef)
+            Dict with "_cls" (class name) and "_ref" (DBRef).
         """
         from bson.son import SON
 
@@ -462,20 +491,33 @@ class AsyncGenericReferenceField(BaseField):
 
         return SON((("_cls", document._class_name), ("_ref", ref)))
 
-    def to_python(self, value):
-        """Convert MongoDB value to Python."""
-        # If already a document, return it
+    def to_python(self, value: Any) -> Any:
+        """Convert MongoDB value to Python.
+
+        Args:
+            value: The value from MongoDB.
+
+        Returns:
+            The Python representation.
+        """
         if isinstance(value, BaseDocument):
             return value
 
-        # If it's the dict format, keep it for lazy loading
         if isinstance(value, dict):
             return value
 
         return value
 
-    def prepare_query_value(self, op, value):
-        """Prepare value for query operations."""
+    def prepare_query_value(self, op: str, value: Any) -> Any:
+        """Prepare value for query operations.
+
+        Args:
+            op: The query operation.
+            value: The value to prepare.
+
+        Returns:
+            The prepared value for MongoDB query.
+        """
         if value is None:
             return None
 
@@ -508,15 +550,20 @@ class AsyncCachedReferenceField(BaseField):
         full_author = await Post.author.fetch(post)
     """
 
-    def __init__(self, document_type, fields=None, auto_sync=False, **kwargs):
-        """
-        Initialize the Async Cached Reference Field.
+    def __init__(
+        self,
+        document_type: Union[str, Type[BaseDocument]],
+        fields: Optional[List[str]] = None,
+        auto_sync: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize the Async Cached Reference Field.
 
         Args:
-            document_type: The type of Document that will be referenced
-            fields: List of fields to cache from the referenced document
-            auto_sync: If True, automatically sync cached fields (NOT IMPLEMENTED for async)
-            **kwargs: Keyword arguments passed to parent BaseField
+            document_type: The type of Document that will be referenced.
+            fields: List of fields to cache from the referenced document.
+            auto_sync: If True, automatically sync cached fields (NOT IMPLEMENTED for async).
+            **kwargs: Keyword arguments passed to parent BaseField.
         """
         if fields is None:
             fields = []
@@ -532,9 +579,10 @@ class AsyncCachedReferenceField(BaseField):
         if auto_sync:
             # Auto-sync is complex for async, not implementing initially
             import warnings
+
             warnings.warn(
                 "auto_sync is not yet implemented for AsyncCachedReferenceField",
-                UserWarning
+                UserWarning,
             )
 
         self.auto_sync = False  # Disabled for async
@@ -544,8 +592,12 @@ class AsyncCachedReferenceField(BaseField):
         self.set_auto_dereferencing(False)
 
     @property
-    def document_type(self):
-        """Get the actual document class (resolve string references)."""
+    def document_type(self) -> Type[BaseDocument]:
+        """Get the actual document class (resolve string references).
+
+        Returns:
+            The resolved document class.
+        """
         if isinstance(self.document_type_obj, str):
             if self.document_type_obj == RECURSIVE_REFERENCE_CONSTANT:
                 self.document_type_obj = self.owner_document
@@ -554,8 +606,21 @@ class AsyncCachedReferenceField(BaseField):
         return self.document_type_obj
 
     @staticmethod
-    async def _async_lazy_load_ref(ref_cls, dbref):
-        """Async dereference a DBRef."""
+    async def _async_lazy_load_ref(
+        ref_cls: Type[BaseDocument], dbref: DBRef
+    ) -> BaseDocument:
+        """Async dereference a DBRef.
+
+        Args:
+            ref_cls: The document class to dereference to.
+            dbref: The DBRef to dereference.
+
+        Returns:
+            The dereferenced document instance.
+
+        Raises:
+            DoesNotExist: If the referenced document doesn't exist.
+        """
         db = await ref_cls._get_async_db()
         collection = db[dbref.collection]
 
@@ -568,17 +633,16 @@ class AsyncCachedReferenceField(BaseField):
 
         return ref_cls._from_son(dereferenced_son)
 
-    async def fetch(self, instance):
-        """
-        Fetch the full referenced document.
+    async def fetch(self, instance: BaseDocument) -> Optional[BaseDocument]:
+        """Fetch the full referenced document.
 
         This loads all fields, not just the cached ones.
 
         Args:
-            instance: The document instance that owns this field
+            instance: The document instance that owns this field.
 
         Returns:
-            The full dereferenced document
+            The full dereferenced document.
         """
         value = instance._data.get(self.name)
 
@@ -600,43 +664,57 @@ class AsyncCachedReferenceField(BaseField):
 
         return None
 
-    def __get__(self, instance, owner):
-        """
-        Return the cached reference data.
+    def __get__(self, instance: Optional[BaseDocument], owner: Type) -> Any:
+        """Return the cached reference data.
 
         For AsyncCachedReferenceField, this returns a dict with _id and cached fields.
+
+        Args:
+            instance: The document instance.
+            owner: The document class.
+
+        Returns:
+            The field instance if called on class, otherwise the cached reference value.
         """
         if instance is None:
             return self
 
         value = instance._data.get(self.name)
 
-        # Convert dict to a pseudo-document object for easier access
         if isinstance(value, dict) and not isinstance(value, BaseDocument):
-            # Create a simple object that allows attribute access
+
             class CachedReference:
-                def __init__(self, data, field):
+                def __init__(self, data: Any, field: Any) -> None:
                     self._data = data
                     self._field = field
 
-                def __getattr__(self, name):
+                def __getattr__(self, name: str) -> Any:
                     if name in self._data:
                         return self._data[name]
                     raise AttributeError(f"Cached field '{name}' not available")
 
-                def __repr__(self):
+                def __repr__(self) -> str:
                     return f"<CachedReference: {self._data}>"
 
             return CachedReference(value, self)
 
         return value
 
-    def to_mongo(self, document, use_db_field=True, fields=None):
-        """
-        Convert to MongoDB format with cached fields.
+    def to_mongo(
+        self,
+        document: BaseDocument,
+        use_db_field: bool = True,
+        fields: Optional[List[str]] = None,
+    ) -> Any:
+        """Convert to MongoDB format with cached fields.
+
+        Args:
+            document: The document to convert.
+            use_db_field: Whether to use db_field names.
+            fields: Optional list of fields to include.
 
         Returns:
-            Dict with _id and specified cached fields
+            Dict with _id and specified cached fields.
         """
         from bson.son import SON
 
@@ -672,27 +750,48 @@ class AsyncCachedReferenceField(BaseField):
 
         return value
 
-    def to_python(self, value):
-        """Convert MongoDB value to Python."""
+    def to_python(self, value: Any) -> Any:
+        """Convert MongoDB value to Python.
+
+        Args:
+            value: The value from MongoDB.
+
+        Returns:
+            The Python representation.
+        """
         if isinstance(value, BaseDocument):
             return value
 
-        # Keep dict format for cached fields
         if isinstance(value, dict):
             return value
 
         return value
 
-    def validate(self, value):
-        """Validate the cached reference field value."""
+    def validate(self, value: Any) -> None:
+        """Validate the cached reference field value.
+
+        Args:
+            value: The value to validate.
+        """
         if not isinstance(value, self.document_type):
             self.error("An AsyncCachedReferenceField only accepts documents")
 
         if isinstance(value, BaseDocument) and value.id is None:
             self.error("You can only reference documents once they have been saved")
 
-    def prepare_query_value(self, op, value):
-        """Prepare value for query operations."""
+    def prepare_query_value(self, op: str, value: Any) -> Any:
+        """Prepare value for query operations.
+
+        Args:
+            op: The query operation.
+            value: The value to prepare.
+
+        Returns:
+            The prepared value for MongoDB query.
+
+        Raises:
+            NotImplementedError: For unsupported value types.
+        """
         if value is None:
             return None
 

@@ -5,11 +5,13 @@ This module provides async versions of bulk dereferencing operations to
 efficiently load referenced documents and avoid N+1 queries.
 """
 
-from bson import DBRef, ObjectId
-from mongoengine.base.document import BaseDocument
-from mongoengine.base.common import _DocumentRegistry
-from mongoengine.io.aio.connection import _get_async_session
+from typing import Any, Dict, List, Optional, Set, Type, Union
 
+from bson import DBRef, ObjectId
+
+from mongoengine.base.common import _DocumentRegistry
+from mongoengine.base.document import BaseDocument
+from mongoengine.io.aio.connection import _get_async_session
 
 __all__ = ['AsyncDeReference']
 
@@ -34,16 +36,15 @@ class AsyncDeReference:
             print(post.author.name)  # No additional queries!
     """
 
-    async def __call__(self, items, max_depth=1):
-        """
-        Bulk dereference items to a specified depth.
+    async def __call__(self, items: Union[List[Any], Any, None], max_depth: int = 1) -> Union[List[Any], Any, None]:
+        """Bulk dereference items to a specified depth.
 
         Args:
-            items: List of documents to dereference
-            max_depth: Maximum depth to recurse (default: 1)
+            items: List of documents to dereference.
+            max_depth: Maximum depth to recurse (default: 1).
 
         Returns:
-            The items with references dereferenced
+            The items with references dereferenced.
         """
         if items is None or isinstance(items, str):
             return items
@@ -62,16 +63,15 @@ class AsyncDeReference:
 
         return items
 
-    def _find_references(self, items, depth=0):
-        """
-        Recursively find all DBRef references to be dereferenced.
+    def _find_references(self, items: List[Any], depth: int = 0) -> Dict[Type[BaseDocument], Set[Any]]:
+        """Recursively find all DBRef references to be dereferenced.
 
         Args:
-            items: The items to scan for references
-            depth: Current recursion depth
+            items: The items to scan for references.
+            depth: Current recursion depth.
 
         Returns:
-            Dict mapping document classes to sets of ObjectIds
+            Dict mapping document classes to sets of ObjectIds.
         """
         reference_map = {}
 
@@ -116,16 +116,15 @@ class AsyncDeReference:
 
         return reference_map
 
-    def _get_reference_doc_class(self, field, item):
-        """
-        Get the document class that a reference field points to.
+    def _get_reference_doc_class(self, field: Any, item: BaseDocument) -> Optional[Type[BaseDocument]]:
+        """Get the document class that a reference field points to.
 
         Args:
-            field: The field object
-            item: The document instance
+            field: The field object.
+            item: The document instance.
 
         Returns:
-            The referenced document class, or None
+            The referenced document class, or None.
         """
         # Import here to avoid circular imports
         from mongoengine.async_fields import (
@@ -147,9 +146,8 @@ class AsyncDeReference:
 
         return None
 
-    async def _fetch_objects_async(self):
-        """
-        Async bulk fetch all referenced documents.
+    async def _fetch_objects_async(self) -> None:
+        """Async bulk fetch all referenced documents.
 
         This performs one query per document type to load all references
         of that type.
@@ -180,13 +178,12 @@ class AsyncDeReference:
                 # If we can't fetch, skip this document type
                 continue
 
-    def _attach_objects(self, items, depth):
-        """
-        Attach fetched objects back to the original documents.
+    def _attach_objects(self, items: List[Any], depth: int) -> None:
+        """Attach fetched objects back to the original documents.
 
         Args:
-            items: The items to attach objects to
-            depth: Current recursion depth
+            items: The items to attach objects to.
+            depth: Current recursion depth.
         """
         if not items or depth >= self.max_depth:
             return

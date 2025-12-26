@@ -5,13 +5,16 @@ This module provides async versions of QuerySet that use async I/O operations
 for all database interactions.
 """
 
+from typing import Any, AsyncIterator, List, Optional, Union
+
+import pymongo.errors
+from pymongo.collection import ReturnDocument
+
 from mongoengine.context_managers import set_write_concern, set_read_write_concern
 from mongoengine.errors import OperationError, NotUniqueError
 from mongoengine.io.aio.connection import _get_async_session
 from mongoengine.io.aio.operations import AsyncIOOperations
 from mongoengine.queryset.base import BaseQuerySet
-from pymongo.collection import ReturnDocument
-import pymongo.errors
 
 
 class AsyncQuerySet(BaseQuerySet):
@@ -38,24 +41,31 @@ class AsyncQuerySet(BaseQuerySet):
     # I/O operations layer - uses async operations
     _io = AsyncIOOperations
 
-    async def _ensure_collection(self):
-        """
-        Ensure that the collection is loaded.
+    async def _ensure_collection(self) -> Any:
+        """Ensure that the collection is loaded.
 
         For async querysets, the collection may not be available at init time,
         so we lazy-load it on first use.
+
+        Returns:
+            The async collection object.
         """
         if self._collection_obj is None:
             self._collection_obj = await self._document._get_async_collection()
         return self._collection_obj
 
     @property
-    def _collection(self):
-        """
-        Property that returns the collection object.
+    def _collection(self) -> Any:
+        """Get the collection object.
 
         For AsyncQuerySet, if the collection is not yet loaded, we need to
         call await _ensure_collection() before accessing it.
+
+        Returns:
+            The collection object.
+
+        Raises:
+            RuntimeError: If collection not loaded yet.
         """
         if self._collection_obj is None:
             raise RuntimeError(
@@ -64,56 +74,62 @@ class AsyncQuerySet(BaseQuerySet):
             )
         return self._collection_obj
 
-    def __aiter__(self):
-        """
-        Async iteration support.
+    def __aiter__(self) -> AsyncIterator[Any]:
+        """Async iteration support.
 
-        Returns an async iterator over the queryset results.
+        Returns:
+            An async iterator over the queryset results.
         """
         return self._async_iter()
 
-    async def _get_cursor(self):
-        """
-        Get or create the async cursor for this queryset.
+    async def _get_cursor(self) -> Any:
+        """Get or create the async cursor for this queryset.
 
         This method ensures the collection is loaded before creating the cursor.
+
+        Returns:
+            The async cursor object.
         """
-        # Ensure collection is loaded first
         collection = await self._ensure_collection()
 
-        # If _cursor_obj already exists, return it
         if self._cursor_obj is not None:
             return self._cursor_obj
 
-        # Create a new PyMongo async cursor
         if self._read_preference is not None or self._read_concern is not None:
             collection = collection.with_options(
                 read_preference=self._read_preference, read_concern=self._read_concern
             )
             self._cursor_obj = self._io.find(
-                collection, self._query, session=_get_async_session(), **self._cursor_args
+                collection,
+                self._query,
+                session=_get_async_session(),
+                **self._cursor_args,
             )
         else:
             self._cursor_obj = self._io.find(
-                collection, self._query, session=_get_async_session(), **self._cursor_args
+                collection,
+                self._query,
+                session=_get_async_session(),
+                **self._cursor_args,
             )
 
-        # Apply ordering
         if self._ordering:
             self._cursor_obj.sort(self._ordering)
 
-        # Apply limit
         if self._limit is not None:
             self._cursor_obj.limit(self._limit)
 
-        # Apply skip
         if self._skip:
             self._cursor_obj.skip(self._skip)
 
         return self._cursor_obj
 
-    async def _async_iter(self):
-        """Internal async iterator implementation."""
+    async def _async_iter(self) -> AsyncIterator[Any]:
+        """Internal async iterator implementation.
+
+        Yields:
+            Documents from the queryset.
+        """
         cursor = await self._get_cursor()
         async for raw_doc in cursor:
             if self._as_pymongo:
@@ -127,17 +143,16 @@ class AsyncQuerySet(BaseQuerySet):
                 )
                 yield doc
 
-    async def to_list(self, length=None):
-        """
-        Convert queryset to a list asynchronously.
+    async def to_list(self, length: Optional[int] = None) -> List[Any]:
+        """Convert queryset to a list asynchronously.
 
         This is the async equivalent of list(queryset).
 
         Args:
-            length: Maximum number of documents to return
+            length: Maximum number of documents to return.
 
         Returns:
-            List of documents
+            List of documents.
         """
         results = []
         count = 0
@@ -148,12 +163,11 @@ class AsyncQuerySet(BaseQuerySet):
                 break
         return results
 
-    async def first(self):
-        """
-        Get the first document matching the query asynchronously.
+    async def first(self) -> Optional[Any]:
+        """Get the first document matching the query asynchronously.
 
         Returns:
-            First document or None
+            First document or None if no match.
         """
         queryset = self.clone()
         queryset = queryset.limit(1)
@@ -161,19 +175,19 @@ class AsyncQuerySet(BaseQuerySet):
             return doc
         return None
 
-    async def get(self, *q_objs, **query):
-        """
-        Get a single document matching the query asynchronously.
-
-        Raises DoesNotExist if no document found.
-        Raises MultipleObjectsReturned if multiple documents found.
+    async def get(self, *q_objs: Any, **query: Any) -> Any:
+        """Get a single document matching the query asynchronously.
 
         Args:
-            *q_objs: Q objects for complex queries
-            **query: Query filters
+            *q_objs: Q objects for complex queries.
+            **query: Query filters.
 
         Returns:
-            Document matching the query
+            Document matching the query.
+
+        Raises:
+            DoesNotExist: If no document found.
+            MultipleObjectsReturned: If multiple documents found.
         """
         queryset = self.clone()
         if q_objs or query:
@@ -189,25 +203,22 @@ class AsyncQuerySet(BaseQuerySet):
                 break
 
         if count == 0:
-            from mongoengine.errors import DoesNotExist
             msg = "%s matching query does not exist." % queryset._document._class_name
             raise queryset._document.DoesNotExist(msg)
         elif count > 1:
-            from mongoengine.errors import MultipleObjectsReturned
             msg = "%d items returned, only one expected" % count
             raise queryset._document.MultipleObjectsReturned(msg)
 
         return result
 
-    async def count(self, with_limit_and_skip=False):
-        """
-        Count documents matching the query asynchronously.
+    async def count(self, with_limit_and_skip: bool = False) -> int:
+        """Count documents matching the query asynchronously.
 
         Args:
-            with_limit_and_skip: Include limit/skip in count
+            with_limit_and_skip: Include limit/skip in count.
 
         Returns:
-            int: Number of matching documents
+            Number of matching documents.
         """
         if (
             self._limit == 0
@@ -230,10 +241,8 @@ class AsyncQuerySet(BaseQuerySet):
         if self._collation:
             kwargs["collation"] = self._collation
 
-        # Ensure collection is loaded
         collection = await self._ensure_collection()
 
-        # Use async count_documents
         count = await self._io.count_documents(
             collection=collection,
             filter=self._query,
@@ -244,17 +253,21 @@ class AsyncQuerySet(BaseQuerySet):
         self._cursor_obj = None
         return count
 
-    async def delete(self, write_concern=None, _from_doc_delete=False, cascade_refs=None):
-        """
-        Delete all documents matching the query asynchronously.
+    async def delete(
+        self,
+        write_concern: Optional[Any] = None,
+        _from_doc_delete: bool = False,
+        cascade_refs: Optional[Any] = None,
+    ) -> int | None | Any:
+        """Delete all documents matching the query asynchronously.
 
         Args:
-            write_concern: Write concern options
-            _from_doc_delete: Internal flag
-            cascade_refs: Cascade delete to references
+            write_concern: Write concern options.
+            _from_doc_delete: Internal flag.
+            cascade_refs: Cascade delete to references.
 
         Returns:
-            int: Number of deleted documents (if acknowledged)
+            Number of deleted documents (if acknowledged).
         """
         if write_concern is None:
             write_concern = {}
@@ -262,9 +275,6 @@ class AsyncQuerySet(BaseQuerySet):
         queryset = self.clone()
         if queryset._none or queryset._empty:
             return 0
-
-        # Handle cascade deletes if needed
-        # (simplified for now - full implementation would handle all cascade rules)
 
         kwargs = {}
         if self._hint not in (-1, None):
@@ -274,7 +284,6 @@ class AsyncQuerySet(BaseQuerySet):
         if self._comment:
             kwargs["comment"] = self._comment
 
-        # Ensure collection is loaded
         collection = await queryset._ensure_collection()
 
         with set_write_concern(collection, write_concern) as collection:
@@ -290,28 +299,31 @@ class AsyncQuerySet(BaseQuerySet):
 
     async def update(
         self,
-        upsert=False,
-        multi=True,
-        write_concern=None,
-        read_concern=None,
-        full_result=False,
-        array_filters=None,
-        **update,
-    ):
-        """
-        Update all documents matching the query asynchronously.
+        upsert: bool = False,
+        multi: bool = True,
+        write_concern: Optional[Any] = None,
+        read_concern: Optional[Any] = None,
+        full_result: bool = False,
+        array_filters: Optional[List[Any]] = None,
+        **update: Any,
+    ) -> Union[int, Any]:
+        """Update all documents matching the query asynchronously.
 
         Args:
-            upsert: Insert if no documents match
-            multi: Update multiple documents
-            write_concern: Write concern options
-            read_concern: Read concern options
-            full_result: Return full UpdateResult
-            array_filters: Array filters for update
-            **update: Update operations
+            upsert: Insert if no documents match.
+            multi: Update multiple documents.
+            write_concern: Write concern options.
+            read_concern: Read concern options.
+            full_result: Return full UpdateResult.
+            array_filters: Array filters for update.
+            **update: Update operations.
 
         Returns:
-            Number of updated documents (or UpdateResult if full_result=True)
+            Number of updated documents (or UpdateResult if full_result=True).
+
+        Raises:
+            OperationError: If no update parameters provided.
+            NotUniqueError: If update violates unique constraint.
         """
         if not update and not upsert:
             raise OperationError("No update parameters, would remove data")
@@ -389,24 +401,27 @@ class AsyncQuerySet(BaseQuerySet):
 
     async def modify(
         self,
-        upsert=False,
-        remove=False,
-        new=False,
-        array_filters=None,
-        **update,
-    ):
-        """
-        Atomically find and modify a document asynchronously.
+        upsert: bool = False,
+        remove: bool = False,
+        new: bool = False,
+        array_filters: Optional[List[Any]] = None,
+        **update: Any,
+    ) -> Optional[Any]:
+        """Atomically find and modify a document asynchronously.
 
         Args:
-            upsert: Insert if no document matches
-            remove: Remove instead of update
-            new: Return updated document (vs original)
-            array_filters: Array filters for update
-            **update: Update operations
+            upsert: Insert if no document matches.
+            remove: Remove instead of update.
+            new: Return updated document (vs original).
+            array_filters: Array filters for update.
+            **update: Update operations.
 
         Returns:
-            Modified document or None
+            Modified document or None if no match.
+
+        Raises:
+            OperationError: If conflicting parameters or no update parameters.
+            NotUniqueError: If update violates unique constraint.
         """
         if remove and new:
             raise OperationError("Conflicting parameters: remove and new")
@@ -426,6 +441,7 @@ class AsyncQuerySet(BaseQuerySet):
 
         if not remove:
             from mongoengine.queryset import transform
+
             update = transform.update(queryset._document, **update)
 
         sort = queryset._ordering
@@ -468,15 +484,14 @@ class AsyncQuerySet(BaseQuerySet):
 
         return result
 
-    async def distinct(self, field):
-        """
-        Get distinct values for a field asynchronously.
+    async def distinct(self, field: str) -> List[Any]:
+        """Get distinct values for a field asynchronously.
 
         Args:
-            field: Field name
+            field: Field name.
 
         Returns:
-            List of distinct values
+            List of distinct values.
         """
         queryset = self.clone()
 
@@ -485,7 +500,6 @@ class AsyncQuerySet(BaseQuerySet):
         except:
             pass
 
-        # Ensure collection is loaded
         collection = await queryset._ensure_collection()
 
         raw_values = await self._io.distinct(
@@ -498,18 +512,16 @@ class AsyncQuerySet(BaseQuerySet):
         if not self._auto_dereference:
             return raw_values
 
-        # Handle dereferencing if needed
         return raw_values
 
-    async def sum(self, field):
-        """
-        Sum values of a field asynchronously.
+    async def sum(self, field: str) -> Union[int, float]:
+        """Sum values of a field asynchronously.
 
         Args:
-            field: Field name
+            field: Field name.
 
         Returns:
-            Sum of field values
+            Sum of field values.
         """
         db_field = self._fields_to_dbfields([field]).pop()
         pipeline = [
@@ -517,7 +529,6 @@ class AsyncQuerySet(BaseQuerySet):
             {"$group": {"_id": "sum", "total": {"$sum": "$" + db_field}}},
         ]
 
-        # Ensure collection is loaded
         collection = await self._ensure_collection()
 
         result = []
@@ -533,15 +544,14 @@ class AsyncQuerySet(BaseQuerySet):
             return result[0]["total"]
         return 0
 
-    async def average(self, field):
-        """
-        Average values of a field asynchronously.
+    async def average(self, field: str) -> Union[int, float]:
+        """Average values of a field asynchronously.
 
         Args:
-            field: Field name
+            field: Field name.
 
         Returns:
-            Average of field values
+            Average of field values.
         """
         db_field = self._fields_to_dbfields([field]).pop()
         pipeline = [
@@ -549,7 +559,6 @@ class AsyncQuerySet(BaseQuerySet):
             {"$group": {"_id": "avg", "total": {"$avg": "$" + db_field}}},
         ]
 
-        # Ensure collection is loaded
         collection = await self._ensure_collection()
 
         result = []
@@ -565,18 +574,17 @@ class AsyncQuerySet(BaseQuerySet):
             return result[0]["total"]
         return 0
 
-    async def select_related(self, max_depth=1):
-        """
-        Bulk dereference referenced documents to avoid N+1 queries.
+    async def select_related(self, max_depth: int = 1) -> List[Any]:
+        """Bulk dereference referenced documents to avoid N+1 queries.
 
         This method fetches all referenced documents in a single batch of
         queries, significantly improving performance when accessing references.
 
         Args:
-            max_depth: Maximum depth to recursively dereference (default: 1)
+            max_depth: Maximum depth to recursively dereference (default: 1).
 
         Returns:
-            List of documents with references pre-loaded
+            List of documents with references pre-loaded.
 
         Example:
             # Without select_related (N+1 queries):
@@ -594,17 +602,15 @@ class AsyncQuerySet(BaseQuerySet):
         """
         from mongoengine.async_dereference import AsyncDeReference
 
-        # Get all documents first
         docs = await self.to_list()
 
         if not docs:
             return docs
 
-        # Bulk dereference
         dereferencer = AsyncDeReference()
         await dereferencer(docs, max_depth=max_depth + 1)
 
         return docs
 
 
-__all__ = ['AsyncQuerySet']
+__all__ = ["AsyncQuerySet"]
