@@ -1,0 +1,17 @@
+# FastAPI and server
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# MongoEngine (using local version)
+# mongoengine will be installed from parent directory
+
+# PyMongo (for MongoEngine)
+pymongo>=4.0,<5.0
+
+# Data generation
+faker==22.6.0
+
+# Utilities
+python-dotenv==1.0.0

@@ -1,0 +1,28 @@
+{
+  "target": "sync",
+  "scenario": "realistic",
+  "timestamp": "20251226_152338",
+  "config": {
+    "users": 300,
+    "duration": "5m",
+    "spawn_rate": 15,
+    "api_host": "http://localhost:8000"
+  },
+  "exit_code": 0,
+  "resource_summary": {
+    "duration_seconds": 272.0,
+    "samples": 272,
+    "cpu": {
+      "avg": 53.87757352941177,
+      "max": 100.0,
+      "min": 12.7,
+      "p95": 95.86499999999998
+    },
+    "memory_mb": {
+      "avg": 6929.585765165441,
+      "max": 7712.15625,
+      "min": 6302.71875,
+      "p95": 7566.95546875
+    }
+  }
+}
