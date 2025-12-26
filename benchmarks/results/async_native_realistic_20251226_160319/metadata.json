@@ -1,0 +1,28 @@
+{
+  "target": "async_native",
+  "scenario": "realistic",
+  "timestamp": "20251226_160319",
+  "config": {
+    "users": 300,
+    "duration": "5m",
+    "spawn_rate": 15,
+    "api_host": "http://localhost:8001"
+  },
+  "exit_code": 0,
+  "resource_summary": {
+    "duration_seconds": 272.0,
+    "samples": 272,
+    "cpu": {
+      "avg": 36.08345588235294,
+      "max": 90.2,
+      "min": 11.2,
+      "p95": 64.615
+    },
+    "memory_mb": {
+      "avg": 6714.850758272059,
+      "max": 6978.375,
+      "min": 6258.875,
+      "p95": 6822.77109375
+    }
+  }
+}
