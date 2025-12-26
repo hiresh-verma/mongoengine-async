@@ -38,10 +38,7 @@ async def async_db():
     Tests will skip gracefully on standalone MongoDB.
     """
     await async_disconnect_all()
-    await async_connect(
-        "mongoenginetest_async",
-        host="localhost", port=27017,
-    )
+    await async_connect("mongoenginetest_async", host="localhost", port=27017, port=27017)
 
     # Clean up collections (both default and any alternate collections)
     try:
@@ -63,24 +60,22 @@ async def async_multi_db():
     """Set up multiple async database connections."""
     await async_disconnect_all()
 
-    atlas_host = (
-        "localhost"
-    )
-
     # Actually connect to both databases (not just register)
     try:
         # Connect to default database
         await async_connect(
             "mongoenginetest_async",
             alias="default",
-            host=atlas_host,
+            host="localhost", port=27017,
+            port=27017,
         )
 
         # Connect to testdb2 database
         await async_connect(
             "mongoenginetest_async2",
             alias="testdb2",
-            host=atlas_host,
+            host="localhost", port=27017,
+            port=27017,
         )
 
         # Clean up collections in default db
