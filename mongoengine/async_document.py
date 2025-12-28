@@ -5,129 +5,411 @@ This module provides async versions of MongoEngine document classes that use
 async I/O operations for all database interactions.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+import re
 
-from mongoengine.async_queryset_manager import AsyncQuerySetManager
+import pymongo
+from bson import DBRef
+from pymongo import ReadPreference
+from pymongo.errors import DuplicateKeyError
+
+from mongoengine import signals
+from mongoengine.async_context_managers import async_switch_db, async_switch_collection
+from mongoengine.async_pymongo_support import async_list_collection_names
+from mongoengine.base import (
+    BaseDict,
+    BaseList,
+    EmbeddedDocumentList,
+    TopLevelDocumentMetaclass,
+    _DocumentRegistry,
+)
 from mongoengine.base.document import BaseDocument
+from mongoengine.base.utils import NonOrderedList
+from mongoengine.common import _import_class
 from mongoengine.connection import DEFAULT_CONNECTION_NAME
 from mongoengine.context_managers import set_write_concern
-from mongoengine.document import TopLevelDocumentMetaclass
-from mongoengine.io.aio.connection import async_get_db, _get_async_session
+from mongoengine.document import (
+    DynamicEmbeddedDocument,
+    EmbeddedDocument,
+    InvalidCollectionError,
+    MapReduceDocument,
+    includes_cls,
+)
+from mongoengine.errors import (
+    InvalidDocumentError,
+    InvalidQueryError,
+    NotUniqueError,
+    OperationError,
+    SaveConditionError,
+)
+from mongoengine.io.aio.connection import _get_async_session
 from mongoengine.io.aio.operations import AsyncIOOperations
+from mongoengine.queryset import transform
+from mongoengine.queryset.aio import AsyncQuerySet, AsyncQuerySetManager
+
+__all__ = (
+    "AsyncDocument",
+    "AsyncDynamicDocument",
+    "DynamicEmbeddedDocument",
+    "EmbeddedDocument",
+    "InvalidCollectionError",
+    "MapReduceDocument",
+    "NotUniqueError",
+    "OperationError",
+)
 
 
 class AsyncDocument(BaseDocument, metaclass=TopLevelDocumentMetaclass):
+    """The base async class used for defining the structure and properties of
+    collections of documents stored in MongoDB. Inherit from this class, and
+    add fields as class attributes to define a document's structure.
+    Individual documents may then be created by making instances of the
+    :class:`~mongoengine.AsyncDocument` subclass.
+
+    By default, the MongoDB collection used to store documents created using a
+    :class:`~mongoengine.Document` subclass will be the name of the subclass
+    converted to snake_case. A different collection may be specified by
+    providing :attr:`collection` to the :attr:`meta` dictionary in the class
+    definition.
+
+    A :class:`~mongoengine.Document` subclass may be itself subclassed, to
+    create a specialised version of the document that will be stored in the
+    same collection. To facilitate this behaviour a `_cls`
+    field is added to documents (hidden though the MongoEngine interface).
+    To enable this behaviour set :attr:`allow_inheritance` to ``True`` in the
+    :attr:`meta` dictionary.
+
+    A :class:`~mongoengine.Document` may use a **Capped Collection** by
+    specifying :attr:`max_documents` and :attr:`max_size` in the :attr:`meta`
+    dictionary. :attr:`max_documents` is the maximum number of documents that
+    is allowed to be stored in the collection, and :attr:`max_size` is the
+    maximum size of the collection in bytes. :attr:`max_size` is rounded up
+    to the next multiple of 256 by MongoDB internally and mongoengine before.
+    Use also a multiple of 256 to avoid confusions.  If :attr:`max_size` is not
+    specified and :attr:`max_documents` is, :attr:`max_size` defaults to
+    10485760 bytes (10MB).
+
+    Indexes may be created by specifying :attr:`indexes` in the :attr:`meta`
+    dictionary. The value should be a list of field names or tuples of field
+    names. Index direction may be specified by prefixing the field names with
+    a **+** or **-** sign.
+
+    Automatic index creation can be disabled by specifying
+    :attr:`auto_create_index` in the :attr:`meta` dictionary. If this is set to
+    False then indexes will not be created by MongoEngine.  This is useful in
+    production systems where index creation is performed as part of a
+    deployment system.
+
+    By default, _cls will be added to the start of every index (that
+    doesn't contain a list) if allow_inheritance is True. This can be
+    disabled by either setting cls to False on the specific index or
+    by setting index_cls to False on the meta dictionary for the document.
+
+    By default, any extra attribute existing in stored data but not declared
+    in your model will raise a :class:`~mongoengine.FieldDoesNotExist` error.
+    This can be disabled by setting :attr:`strict` to ``False``
+    in the :attr:`meta` dictionary.
     """
-    Async version of Document class.
 
-    This class inherits all business logic from BaseDocument and provides
-    async versions of I/O methods (save, delete, reload, etc.).
-
-    Usage:
-        class User(AsyncDocument):
-            name = StringField()
-            email = EmailField()
-
-        # Async operations
-        user = User(name='Alice', email='alice@example.com')
-        await user.save()
-
-        user = await User.objects.get(name='Alice')
-        await user.delete()
-    """
-
+    # my_metaclass is defined so that metaclass can be queried in Python 2 & 3
     my_metaclass = TopLevelDocumentMetaclass
+
     __slots__ = ("__objects",)
-
-    # I/O operations layer - uses async operations
-    _io = AsyncIOOperations
-
-    # QuerySet manager for async operations
     objects = AsyncQuerySetManager()
 
-    @property
-    def pk(self) -> Optional[Any]:
-        """Get the primary key.
+    # I/O operations layer - async version
+    _io = AsyncIOOperations()
 
-        Returns:
-            The primary key value or None if not set.
-        """
+    @property
+    def pk(self):
+        """Get the primary key."""
         if "id_field" not in self._meta:
             return None
         return getattr(self, self._meta["id_field"])
 
     @pk.setter
-    def pk(self, value: Any) -> None:
-        """Set the primary key.
-
-        Args:
-            value: The primary key value to set.
-        """
+    def pk(self, value):
+        """Set the primary key."""
         return setattr(self, self._meta["id_field"], value)
 
-    @classmethod
-    async def _get_async_db(cls) -> Any:
-        """Get the async database for this document.
-
-        Returns:
-            AsyncDatabase instance.
+    def __hash__(self):
+        """Return the hash based on the PK of this document. If it's new
+        and doesn't have a PK yet, return the default object hash instead.
         """
+        if self.pk is None:
+            return super(BaseDocument, self).__hash__()
+
+        return hash(self.pk)
+
+    @classmethod
+    async def _get_async_db(cls):
+        """Get the async database for this document class."""
+        from mongoengine.io.aio.connection import async_get_db
+
         return await async_get_db(cls._meta.get("db_alias", DEFAULT_CONNECTION_NAME))
 
     @classmethod
-    async def _get_async_collection(cls) -> Any:
-        """Get the async collection for this document.
+    def _disconnect(cls):
+        """Detach the AsyncDocument class from the (cached) async collection"""
+        if hasattr(cls, "_async_collection"):
+            cls._async_collection = None
 
-        Returns:
-            AsyncCollection instance.
+    @classmethod
+    def _get_collection(cls):
+        """Return the async PyMongo collection reference (synchronous).
+
+        This method returns a cached collection reference if available,
+        or creates a basic collection reference without async initialization.
+
+        Note: This is synchronous and suitable for use in QuerySetManager.
+        For full initialization with indexes, use await _get_async_collection().
+
+        Raises:
+            ConnectionError: If database connection hasn't been established yet.
+                Use `await async_connect()` first to establish connection.
         """
-        if not hasattr(cls, "_collection") or cls._collection is None:
-            db = await cls._get_async_db()
-            collection_name = cls._get_collection_name()
+        if not hasattr(cls, "_async_collection") or cls._async_collection is None:
+            # For regular collections, we can get the reference synchronously
+            # from the cached database connection
+            from mongoengine.io.aio.connection import _async_dbs
+            from mongoengine.connection import DEFAULT_CONNECTION_NAME
 
-            if "capped" in cls._meta:
-                cls._collection = await cls._io.create_collection(
-                    db,
-                    collection_name,
-                    size=cls._meta.get("max_size"),
-                    max=cls._meta.get("max_documents"),
-                    capped=True,
+            alias = cls._meta.get("db_alias", DEFAULT_CONNECTION_NAME)
+
+            # Access cached database (must already be connected)
+            if alias not in _async_dbs:
+                raise ConnectionError(
+                    f"Database '{alias}' not connected. "
+                    f"Use 'await async_connect()' to establish connection first."
                 )
-            else:
-                cls._collection = db[collection_name]
 
-        return cls._collection
+            db = _async_dbs[alias]
+            collection_name = cls._get_collection_name()
+            cls._async_collection = db[collection_name]
+
+        return cls._async_collection
+
+    @classmethod
+    async def _get_async_collection(cls):
+        """Return the async PyMongo collection corresponding to this document.
+
+        Upon first call, this method:
+        1. Initializes a :class:`~motor.motor_asyncio.AsyncIOMotorCollection`
+           corresponding to this document.
+        2. Creates indexes defined in this document's :attr:`meta` dictionary.
+           This happens only if `auto_create_index` is True.
+        """
+        if not hasattr(cls, "_async_collection") or cls._async_collection is None:
+            # Get the collection, either capped, timeseries, or regular.
+            if cls._meta.get("max_size") or cls._meta.get("max_documents"):
+                cls._async_collection = await cls._get_async_capped_collection()
+            elif cls._meta.get("timeseries"):
+                cls._async_collection = await cls._get_async_timeseries_collection()
+            else:
+                db = await cls._get_async_db()
+                collection_name = cls._get_collection_name()
+                cls._async_collection = db[collection_name]
+
+            # Ensure indexes on the collection unless auto_create_index was
+            # set to False. Plus, there is no need to ensure indexes on slave.
+            if cls._meta.get("auto_create_index", True):
+                # Check if we're connected to primary
+                try:
+                    db = await cls._get_async_db()
+                    if db.client.is_primary:
+                        await cls.ensure_indexes()
+                except AttributeError:
+                    # Motor client might not have is_primary, skip check
+                    await cls.ensure_indexes()
+
+        return cls._async_collection
+
+    @classmethod
+    async def _get_async_capped_collection(cls):
+        """Create a new or get an existing capped async PyMongo collection."""
+        db = await cls._get_async_db()
+        collection_name = cls._get_collection_name()
+
+        # Get max document limit and max byte size from meta.
+        max_size = cls._meta.get("max_size") or 10 * 2**20  # 10MB default
+        max_documents = cls._meta.get("max_documents")
+
+        # MongoDB will automatically raise the size to make it a multiple of
+        # 256 bytes. We raise it here ourselves to be able to reliably compare
+        # the options below.
+        if max_size % 256:
+            max_size = (max_size // 256 + 1) * 256
+
+        # If the collection already exists and has different options
+        # (i.e. isn't capped or has different max/size), raise an error.
+        collection_names = await async_list_collection_names(
+            db, session=_get_async_session()
+        )
+        if collection_name in collection_names:
+            collection = db[collection_name]
+            options = await collection.options()
+            if options.get("max") != max_documents or options.get("size") != max_size:
+                raise InvalidCollectionError(
+                    'Cannot create collection "{}" as a capped '
+                    "collection as it already exists".format(cls._collection)
+                )
+
+            return collection
+
+        # Create a new capped collection.
+        opts = {"capped": True, "size": max_size}
+        if max_documents:
+            opts["max"] = max_documents
+
+        return await db.create_collection(
+            collection_name, session=_get_async_session(), **opts
+        )
+
+    @classmethod
+    async def _get_async_timeseries_collection(cls):
+        """Create a new or get an existing timeseries async PyMongo collection."""
+        db = await cls._get_async_db()
+        collection_name = cls._get_collection_name()
+        timeseries_opts = cls._meta.get("timeseries")
+
+        collection_names = await async_list_collection_names(
+            db, session=_get_async_session()
+        )
+        if collection_name in collection_names:
+            collection = db[collection_name]
+            await collection.options()
+            return collection
+
+        opts = {"expireAfterSeconds": timeseries_opts.pop("expireAfterSeconds", None)}
+        return await db.create_collection(
+            name=collection_name,
+            timeseries=timeseries_opts,
+            **opts,
+        )
+
+    def to_mongo(self, *args, **kwargs):
+        data = super().to_mongo(*args, **kwargs)
+
+        # If '_id' is None, try and set it from self._data. If that
+        # doesn't exist either, remove '_id' from the SON completely.
+        if data["_id"] is None:
+            if self._data.get("id") is None:
+                del data["_id"]
+            else:
+                data["_id"] = self._data["id"]
+
+        return data
+
+    async def modify(self, query=None, **update):
+        """Perform an atomic update of the document in the database and reload
+        the document object using updated version.
+
+        Returns True if the document has been updated or False if the document
+        in the database doesn't match the query.
+
+        .. note:: All unsaved changes that have been made to the document are
+            rejected if the method returns True.
+
+        :param query: the update will be performed only if the document in the
+            database matches the query
+        :param update: Django-style update keyword arguments
+        """
+        if query is None:
+            query = {}
+
+        if self.pk is None:
+            raise InvalidDocumentError("The document does not have a primary key.")
+
+        id_field = self._meta["id_field"]
+        query = query.copy() if isinstance(query, dict) else query.to_query(self)
+
+        if id_field not in query:
+            query[id_field] = self.pk
+        elif query[id_field] != self.pk:
+            raise InvalidQueryError(
+                "Invalid document modify query: it must modify only this document."
+            )
+
+        # Need to add shard key to query, or you get an error
+        query.update(self._object_key)
+
+        qs = await self._qs
+        updated = await qs(**query).modify(new=True, **update)
+        if updated is None:
+            return False
+
+        for field in self._fields_ordered:
+            setattr(self, field, self._reload(field, updated[field]))
+
+        self._changed_fields = updated._changed_fields
+        self._created = False
+
+        return True
 
     async def save(
         self,
-        force_insert: bool = False,
-        validate: bool = True,
-        clean: bool = True,
-        write_concern: Optional[Dict[str, Any]] = None,
-        cascade: Optional[bool] = None,
-        cascade_kwargs: Optional[Dict[str, Any]] = None,
-        _refs: Optional[List] = None,
-        save_condition: Optional[Dict[str, Any]] = None,
-        signal_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> "AsyncDocument":
-        """Save the document to the database asynchronously.
+        force_insert=False,
+        validate=True,
+        clean=True,
+        write_concern=None,
+        cascade=None,
+        cascade_kwargs=None,
+        _refs=None,
+        save_condition=None,
+        signal_kwargs=None,
+        **kwargs,
+    ):
+        """Save the :class:`~mongoengine.AsyncDocument` to the database. If the
+        document already exists, it will be updated, otherwise it will be
+        created. Returns the saved object instance.
 
-        Args:
-            force_insert: If True, forces an insert operation.
-            validate: If True, validates the document before saving.
-            clean: If True, calls the clean() method before validation.
-            write_concern: Write concern options.
-            cascade: Cascade save to referenced documents.
-            cascade_kwargs: Kwargs to pass to cascaded saves.
-            save_condition: Conditional save based on query.
-            signal_kwargs: Kwargs to pass to signals.
-            **kwargs: Additional keyword arguments.
+        :param force_insert: only try to create a new document, don't allow
+            updates of existing documents.
+        :param validate: validates the document; set to ``False`` to skip.
+        :param clean: call the document clean method, requires `validate` to be
+            True.
+        :param write_concern: Extra keyword arguments are passed down to
+            :meth:`~pymongo.collection.Collection.save` OR
+            :meth:`~pymongo.collection.Collection.insert`
+            which will be used as options for the resultant
+            ``getLastError`` command.  For example,
+            ``save(..., write_concern={w: 2, fsync: True}, ...)`` will
+            wait until at least two servers have recorded the write and
+            will force an fsync on the primary server.
+        :param cascade: Sets the flag for cascading saves.  You can set a
+            default by setting "cascade" in the document __meta__
+        :param cascade_kwargs: (optional) kwargs dictionary to be passed throw
+            to cascading saves.  Implies ``cascade=True``.
+        :param _refs: A list of processed references used in cascading saves
+        :param save_condition: only perform save if matching record in db
+            satisfies condition(s) (e.g. version number).
+            Raises :class:`OperationError` if the conditions are not satisfied
+        :param signal_kwargs: (optional) kwargs dictionary to be passed to
+            the signal calls.
 
-        Returns:
-            The saved document instance.
+        .. versionchanged:: 0.5
+            In existing documents it only saves changed fields using
+            set / unset.  Saves are cascaded and any
+            :class:`~bson.dbref.DBRef` objects that have changes are
+            saved as well.
+        .. versionchanged:: 0.6
+            Added cascading saves
+        .. versionchanged:: 0.8
+            Cascade saves are optional and default to False.  If you want
+            fine grain control then you can turn off using document
+            meta['cascade'] = True.  Also you can pass different kwargs to
+            the cascade save using cascade_kwargs which overwrites the
+            existing kwargs with custom values.
+        .. versionchanged:: 0.26
+           save() no longer calls :meth:`~mongoengine.Document.ensure_indexes`
+           unless ``meta['auto_create_index_on_save']`` is set to True.
+
         """
-        from mongoengine import signals
+        signal_kwargs = signal_kwargs or {}
+
+        if self._meta.get("abstract"):
+            raise InvalidDocumentError("Cannot save an abstract document.")
+
+        signals.pre_save.send(self.__class__, document=self, **signal_kwargs)
 
         if validate:
             self.validate(clean=clean)
@@ -135,58 +417,110 @@ class AsyncDocument(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         if write_concern is None:
             write_concern = {}
 
+        doc_id = self.to_mongo(fields=[self._meta["id_field"]])
+        created = "_id" not in doc_id or self._created or force_insert
+
+        signals.pre_save_post_validation.send(
+            self.__class__, document=self, created=created, **signal_kwargs
+        )
+        # it might be refreshed by the pre_save_post_validation hook, e.g., for etag generation
         doc = self.to_mongo()
 
-        signal_kwargs = signal_kwargs or {}
-        signals.pre_save.send(self.__class__, document=self, **signal_kwargs)
+        # Initialize the Document's underlying async collection (+create indexes) if not already initialized
+        # Important to do this here to avoid that the index creation gets wrapped in the try/except block below
+        # and turned into mongoengine.OperationError
+        if not hasattr(self, "_async_collection") or self._async_collection is None:
+            _ = await self._get_async_collection()
+        elif self._meta.get("auto_create_index_on_save", False):
+            # ensure_indexes is called as part of _get_async_collection so no need to re-call it again here
+            await self.ensure_indexes()
 
-        if self._created or force_insert:
-            object_id = await self._save_create(doc, force_insert, write_concern)
-            created = True
-        else:
-            object_id, created = await self._save_update(
-                doc, save_condition, write_concern
-            )
+        try:
+            # Save a new document or update an existing one
+            if created:
+                object_id = await self._save_create(
+                    doc=doc, force_insert=force_insert, write_concern=write_concern
+                )
+            else:
+                object_id, created = await self._save_update(
+                    doc, save_condition, write_concern
+                )
 
-        if created:
-            self._created = False
+            if cascade is None:
+                cascade = self._meta.get("cascade", False) or cascade_kwargs is not None
+
+            if cascade:
+                kwargs = {
+                    "force_insert": force_insert,
+                    "validate": validate,
+                    "write_concern": write_concern,
+                    "cascade": cascade,
+                }
+                if cascade_kwargs:  # Allow granular control over cascades
+                    kwargs.update(cascade_kwargs)
+                kwargs["_refs"] = _refs
+                await self.cascade_save(**kwargs)
+
+        except pymongo.errors.DuplicateKeyError as err:
+            message = "Tried to save duplicate unique keys (%s)"
+            raise NotUniqueError(message % err)
+        except pymongo.errors.OperationFailure as err:
+            message = "Could not save document (%s)"
+            if re.match("^E1100[01] duplicate key", str(err)):
+                # E11000 - duplicate key error index
+                # E11001 - duplicate key on update
+                message = "Tried to save duplicate unique keys (%s)"
+                raise NotUniqueError(message % err)
+            raise OperationError(message % err)
+
+        # Make sure we store the PK on this document now that it's saved
         id_field = self._meta["id_field"]
-        self._data[id_field] = self._fields[id_field].to_python(object_id)
+        if created or id_field not in self._meta.get("shard_key", []):
+            self[id_field] = self._fields[id_field].to_python(object_id)
 
         signals.post_save.send(
             self.__class__, document=self, created=created, **signal_kwargs
         )
 
+        self._clear_changed_fields()
+        self._created = False
+
         return self
 
-    def _integrate_shard_key(
-        self, doc: Dict[str, Any], select_dict: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Integrate the collection's shard key to the select_dict.
+    async def _save_create(self, doc, force_insert, write_concern):
+        """Save a new document.
 
-        Args:
-            doc: The document dict.
-            select_dict: The selection dict to update.
-
-        Returns:
-            The updated select_dict.
+        Helper method, should only be used inside save().
         """
-        shard_key = self._meta.get("shard_key", tuple())
-        for k in shard_key:
-            path = self._lookup_field(k.split("."))
-            actual_key = [p.db_field for p in path]
-            val = doc
-            for ak in actual_key:
-                val = val[ak]
-            select_dict[".".join(actual_key)] = val
+        collection = await self._get_async_collection()
+        with set_write_concern(collection, write_concern) as wc_collection:
+            if force_insert:
+                result = await self._io.insert_one(
+                    wc_collection, doc, session=_get_async_session()
+                )
+                return result.inserted_id
+            # insert_one will provoke UniqueError alongside save does not
+            # therefore, it need to catch and call replace_one.
+            if "_id" in doc:
+                select_dict = {"_id": doc["_id"]}
+                select_dict = self._integrate_shard_key(doc, select_dict)
+                raw_object = await self._io.find_one_and_replace(
+                    wc_collection, select_dict, doc, session=_get_async_session()
+                )
+                if raw_object:
+                    return doc["_id"]
 
-        return select_dict
+            result = await self._io.insert_one(
+                wc_collection, doc, session=_get_async_session()
+            )
+            object_id = result.inserted_id
 
-    def _get_update_doc(self) -> Dict[str, Any]:
-        """Get the update document with $set and $unset operations.
+        return object_id
 
-        Returns:
-            Dict containing $set and $unset operations based on document changes.
+    def _get_update_doc(self):
+        """Return a dict containing all the $set and $unset operations
+        that should be sent to MongoDB based on the changes made to this
+        Document.
         """
         updates, removals = self._delta()
 
@@ -198,63 +532,27 @@ class AsyncDocument(BaseDocument, metaclass=TopLevelDocumentMetaclass):
 
         return update_doc
 
-    async def _save_create(
-        self, doc: Dict[str, Any], force_insert: bool, write_concern: Dict[str, Any]
-    ) -> Any:
-        """Save a new document asynchronously.
-
-        Args:
-            doc: The document dict to save.
-            force_insert: Whether to force an insert.
-            write_concern: Write concern options.
-
-        Returns:
-            The inserted document ID.
+    def _integrate_shard_key(self, doc, select_dict):
+        """Integrates the collection's shard key to the `select_dict`, which will be used for the query.
+        The value from the shard key is taken from the `doc` and finally the select_dict is returned.
         """
-        collection = await self._get_async_collection()
 
-        with set_write_concern(collection, write_concern) as wc_collection:
-            if force_insert:
-                result = await self._io.insert_one(
-                    wc_collection, doc, session=_get_async_session()
-                )
-                return result.inserted_id
+        # Need to add shard key to query, or you get an error
+        shard_key = self._meta.get("shard_key", tuple())
+        for k in shard_key:
+            path = self._lookup_field(k.split("."))
+            actual_key = [p.db_field for p in path]
+            val = doc
+            for ak in actual_key:
+                val = val[ak]
+            select_dict[".".join(actual_key)] = val
 
-            if "_id" in doc and doc["_id"] is not None:
-                select_dict = {"_id": doc["_id"]}
-                select_dict = self._integrate_shard_key(doc, select_dict)
-                raw_object = await self._io.find_one_and_replace(
-                    wc_collection, select_dict, doc, session=_get_async_session()
-                )
-                if raw_object:
-                    return doc["_id"]
+        return select_dict
 
-            if "_id" in doc and doc["_id"] is None:
-                doc = doc.copy()
-                del doc["_id"]
+    async def _save_update(self, doc, save_condition, write_concern):
+        """Update an existing document.
 
-            result = await self._io.insert_one(
-                wc_collection, doc, session=_get_async_session()
-            )
-            object_id = result.inserted_id
-
-        return object_id
-
-    async def _save_update(
-        self,
-        doc: Dict[str, Any],
-        save_condition: Optional[Dict[str, Any]],
-        write_concern: Dict[str, Any],
-    ) -> Tuple[Any, bool]:
-        """Update an existing document asynchronously.
-
-        Args:
-            doc: The document dict.
-            save_condition: Optional save condition.
-            write_concern: Write concern options.
-
-        Returns:
-            Tuple of (object_id, created) where created indicates if document was created.
+        Helper method, should only be used inside save().
         """
         collection = await self._get_async_collection()
         object_id = doc["_id"]
@@ -262,11 +560,10 @@ class AsyncDocument(BaseDocument, metaclass=TopLevelDocumentMetaclass):
 
         select_dict = {}
         if save_condition is not None:
-            from mongoengine.queryset import transform
-
             select_dict = transform.query(self.__class__, **save_condition)
 
         select_dict["_id"] = object_id
+
         select_dict = self._integrate_shard_key(doc, select_dict)
 
         update_doc = self._get_update_doc()
@@ -281,136 +578,560 @@ class AsyncDocument(BaseDocument, metaclass=TopLevelDocumentMetaclass):
                     session=_get_async_session(),
                 )
                 last_error = result.raw_result
-
             if not upsert and last_error["n"] == 0:
-                from mongoengine.errors import SaveConditionError
-
                 raise SaveConditionError(
                     "Race condition preventing document update detected"
                 )
-
             if last_error is not None:
                 updated_existing = last_error.get("updatedExisting")
                 if updated_existing is False:
                     created = True
+                    # !!! This is bad, means we accidentally created a new,
+                    # potentially corrupted document. See
+                    # https://github.com/MongoEngine/mongoengine/issues/564
 
         return object_id, created
 
-    async def delete(
-        self, signal_kwargs: Optional[Dict[str, Any]] = None, **write_concern: Any
-    ) -> None:
-        """Delete this document asynchronously.
-
-        Args:
-            signal_kwargs: Kwargs to pass to signals.
-            **write_concern: Write concern options.
+    async def cascade_save(self, **kwargs):
+        """Recursively save any references and generic references on the
+        document.
         """
-        from mongoengine import signals
+        _refs = kwargs.get("_refs") or []
 
+        ReferenceField = _import_class("ReferenceField")
+        GenericReferenceField = _import_class("GenericReferenceField")
+
+        for name, cls in self._fields.items():
+            if not isinstance(cls, (ReferenceField, GenericReferenceField)):
+                continue
+
+            ref = self._data.get(name)
+            if not ref or isinstance(ref, DBRef):
+                continue
+
+            if not getattr(ref, "_changed_fields", True):
+                continue
+
+            ref_id = f"{ref.__class__.__name__},{str(ref._data)}"
+            if ref and ref_id not in _refs:
+                _refs.append(ref_id)
+                kwargs["_refs"] = _refs
+                await ref.save(**kwargs)
+                ref._changed_fields = []
+
+    async def _get_queryset(self):
+        """Return the default async queryset corresponding to this document."""
+        if not hasattr(self, "__objects"):
+
+            queryset_class = self._meta.get("queryset_class", AsyncQuerySet)
+            collection = await self._get_async_collection()
+            self.__objects = queryset_class(self.__class__, collection)
+        return self.__objects
+
+    # Alias for backwards compatibility with code that uses _qs as a property
+    @property
+    def _qs(self):
+        """Backwards compatibility alias - returns a coroutine that needs to be awaited."""
+        return self._get_queryset()
+
+    @property
+    def _object_key(self):
+        """Return a query dict that can be used to fetch this document.
+
+        Most of the time the dict is a simple PK lookup, but in case of
+        a sharded collection with a compound shard key, it can contain a more
+        complex query.
+
+        Note that the dict returned by this method uses MongoEngine field
+        names instead of PyMongo field names (e.g. "pk" instead of "_id",
+        "some__nested__field" instead of "some.nested.field", etc.).
+        """
+        select_dict = {"pk": self.pk}
+        shard_key = self.__class__._meta.get("shard_key", tuple())
+        for k in shard_key:
+            val = self
+            field_parts = k.split(".")
+            for part in field_parts:
+                val = getattr(val, part)
+            select_dict["__".join(field_parts)] = val
+        return select_dict
+
+    async def update(self, **kwargs):
+        """Performs an update on the :class:`~mongoengine.AsyncDocument`
+        A convenience wrapper to :meth:`~mongoengine.AsyncQuerySet.update`.
+
+        Raises :class:`OperationError` if called on an object that has not yet
+        been saved.
+        """
+        qs = await self._get_queryset()
+        if self.pk is None:
+            if kwargs.get("upsert", False):
+                query = self.to_mongo()
+                if "_cls" in query:
+                    del query["_cls"]
+                return await qs.filter(**query).update_one(**kwargs)
+            else:
+                raise OperationError("attempt to update a document not yet saved")
+
+        # Need to add shard key to query, or you get an error
+        return await qs.filter(**self._object_key).update_one(**kwargs)
+
+    async def delete(self, signal_kwargs=None, **write_concern):
+        """Delete the :class:`~mongoengine.AsyncDocument` from the database. This
+        will only take effect if the document has been previously saved.
+
+        :param signal_kwargs: (optional) kwargs dictionary to be passed to
+            the signal calls.
+        :param write_concern: Extra keyword arguments are passed down which
+            will be used as options for the resultant ``getLastError`` command.
+            For example, ``save(..., w: 2, fsync: True)`` will
+            wait until at least two servers have recorded the write and
+            will force an fsync on the primary server.
+        """
         signal_kwargs = signal_kwargs or {}
         signals.pre_delete.send(self.__class__, document=self, **signal_kwargs)
 
-        collection = await self._get_async_collection()
+        # Delete FileFields separately
+        FileField = _import_class("FileField")
+        for name, field in self._fields.items():
+            if isinstance(field, FileField):
+                # FileField.delete() might be async in async documents
+                file_field = getattr(self, name)
+                if hasattr(file_field, "delete"):
+                    delete_method = file_field.delete()
+                    if hasattr(delete_method, "__await__"):
+                        await delete_method
 
-        with set_write_concern(collection, write_concern) as wc_collection:
-            await self._io.delete_one(
-                wc_collection,
-                {"_id": self.pk},
-                session=_get_async_session(),
+        try:
+            qs = await self._get_queryset()
+            await qs.filter(**self._object_key).delete(
+                write_concern=write_concern, _from_doc_delete=True
             )
-
+        except pymongo.errors.OperationFailure as err:
+            message = "Could not delete document (%s)" % err.args
+            raise OperationError(message)
         signals.post_delete.send(self.__class__, document=self, **signal_kwargs)
 
-    async def reload(self, *fields: str, **kwargs: Any) -> "AsyncDocument":
-        """Reload this document from the database asynchronously.
-
-        Args:
-            *fields: Specific fields to reload.
-            **kwargs: Additional options.
-
-        Returns:
-            The reloaded document instance.
-
-        Raises:
-            DoesNotExist: If the document no longer exists in the database.
+    async def switch_db(self, db_alias, keep_created=True):
         """
-        collection = await self._get_async_collection()
+        Temporarily switch the database for a document instance.
 
-        projection = None
-        if fields:
-            projection = {field: 1 for field in fields}
-            projection["_id"] = 1
+        Only really useful for archiving off data and calling `save()`::
 
-        obj = await self._io.find_one(
-            collection,
-            {"_id": self.pk},
-            projection=projection,
-            session=_get_async_session(),
+            user = await User.objects.get(id=user_id)
+            await user.switch_db('archive-db')
+            await user.save()
+
+        :param str db_alias: The database alias to use for saving the document
+
+        :param bool keep_created: keep self._created value after switching db, else is reset to True
+
+
+        .. seealso::
+            Use :class:`~mongoengine.async_context_managers.async_switch_collection`
+            if you need to read from another collection
+        """
+        async with async_switch_db(self.__class__, db_alias) as cls:
+            collection = await cls._get_async_collection()
+            db = await cls._get_async_db()
+
+        # Create async lambda wrappers
+        async def get_collection():
+            return collection
+
+        async def get_db():
+            return db
+
+        self._get_async_collection = get_collection
+        self._get_async_db = get_db
+        self._async_collection = collection
+        self._created = True if not keep_created else self._created
+        qs = await self._get_queryset()
+        self.__objects = qs
+        self.__objects._collection_obj = collection
+        return self
+
+    async def switch_collection(self, collection_name, keep_created=True):
+        """
+        Temporarily switch the collection for a document instance.
+
+        Only really useful for archiving off data and calling `save()`::
+
+            user = await User.objects.get(id=user_id)
+            await user.switch_collection('old-users')
+            await user.save()
+
+        :param str collection_name: The database alias to use for saving the
+            document
+
+        :param bool keep_created: keep self._created value after switching collection, else is reset to True
+
+
+        .. seealso::
+            Use :class:`~mongoengine.async_context_managers.async_switch_db`
+            if you need to read from another database
+        """
+        async with async_switch_collection(self.__class__, collection_name) as cls:
+            collection = await cls._get_async_collection()
+
+        # Create async lambda wrapper
+        async def get_collection():
+            return collection
+
+        self._get_async_collection = get_collection
+        self._async_collection = collection
+        self._created = True if not keep_created else self._created
+        qs = await self._get_queryset()
+        self.__objects = qs
+        self.__objects._collection_obj = collection
+        return self
+
+    async def select_related(self, max_depth=1):
+        """Handles dereferencing of :class:`~bson.dbref.DBRef` objects to
+        a maximum depth in order to cut down the number queries to mongodb.
+        """
+        from mongoengine.async_dereference import AsyncDeReference
+
+        await AsyncDeReference()([self], max_depth + 1)
+        return self
+
+    async def reload(self, *fields, **kwargs):
+        """Reloads all attributes from the database.
+
+        :param fields: (optional) args list of fields to reload
+        :param max_depth: (optional) depth of dereferencing to follow
+        """
+        max_depth = 1
+        if fields and isinstance(fields[0], int):
+            max_depth = fields[0]
+            fields = fields[1:]
+        elif "max_depth" in kwargs:
+            max_depth = kwargs["max_depth"]
+
+        if self.pk is None:
+            raise self.DoesNotExist("Document does not exist")
+
+        qs = await self._get_queryset()
+        obj = (
+            qs.read_preference(ReadPreference.PRIMARY)
+            .filter(**self._object_key)
+            .only(*fields)
+            .limit(1)
+            .select_related(max_depth=max_depth)
         )
 
-        if obj is None:
-            from mongoengine.errors import DoesNotExist
+        # Await the queryset result
+        obj_list = await obj
+        if obj_list:
+            obj = obj_list[0]
+        else:
+            raise self.DoesNotExist("Document does not exist")
+        for field in obj._data:
+            if not fields or field in fields:
+                try:
+                    setattr(self, field, self._reload(field, obj[field]))
+                except (KeyError, AttributeError):
+                    try:
+                        # If field is a special field, e.g. items is stored as _reserved_items,
+                        # a KeyError is thrown. So try to retrieve the field from _data
+                        setattr(self, field, self._reload(field, obj._data.get(field)))
+                    except KeyError:
+                        # If field is removed from the database while the object
+                        # is in memory, a reload would cause a KeyError
+                        # i.e. obj.update(unset__field=1) followed by obj.reload()
+                        delattr(self, field)
 
-            raise DoesNotExist(f"{self.__class__.__name__} object does not exist")
+        self._changed_fields = (
+            list(set(self._changed_fields) - set(fields))
+            if fields
+            else obj._changed_fields
+        )
+        self._created = False
+        return self
 
-        for field_name in self._fields_ordered:
-            if fields and field_name not in fields:
-                continue
-            if field_name in obj:
-                setattr(
-                    self,
-                    field_name,
-                    self._fields[field_name].to_python(obj[field_name]),
+    def _reload(self, key, value):
+        """Used by :meth:`~mongoengine.AsyncDocument.reload` to ensure the
+        correct instance is linked to self.
+        """
+        if isinstance(value, BaseDict):
+            value = [(k, self._reload(k, v)) for k, v in value.items()]
+            value = BaseDict(value, self, key)
+        elif isinstance(value, EmbeddedDocumentList):
+            value = [self._reload(key, v) for v in value]
+            value = EmbeddedDocumentList(value, self, key)
+        elif isinstance(value, BaseList):
+            value = [self._reload(key, v) for v in value]
+            value = BaseList(value, self, key)
+        elif isinstance(value, (EmbeddedDocument, DynamicEmbeddedDocument)):
+            value._instance = None
+            value._changed_fields = []
+        return value
+
+    def to_dbref(self):
+        """Returns an instance of :class:`~bson.dbref.DBRef` useful in
+        `__raw__` queries."""
+        if self.pk is None:
+            msg = "Only saved documents can have a valid dbref"
+            raise OperationError(msg)
+        return DBRef(self.__class__._get_collection_name(), self.pk)
+
+    @classmethod
+    def register_delete_rule(cls, document_cls, field_name, rule):
+        """This method registers the delete rules to apply when removing this
+        object.
+        """
+        classes = [
+            _DocumentRegistry.get(class_name)
+            for class_name in cls._subclasses
+            if class_name != cls.__name__
+        ] + [cls]
+        documents = [
+            _DocumentRegistry.get(class_name)
+            for class_name in document_cls._subclasses
+            if class_name != document_cls.__name__
+        ] + [document_cls]
+
+        for klass in classes:
+            for document_cls in documents:
+                delete_rules = klass._meta.get("delete_rules") or {}
+                delete_rules[(document_cls, field_name)] = rule
+                klass._meta["delete_rules"] = delete_rules
+
+    @classmethod
+    async def drop_collection(cls):
+        """Drops the entire collection associated with this
+        :class:`~mongoengine.AsyncDocument` type from the database.
+
+        Raises :class:`OperationError` if the document has no collection set
+        (i.g. if it is `abstract`)
+        """
+        coll_name = cls._get_collection_name()
+        if not coll_name:
+            raise OperationError(
+                "Document %s has no collection defined (is it abstract ?)" % cls
+            )
+        cls._async_collection = None
+        db = await cls._get_async_db()
+        await db.drop_collection(coll_name, session=_get_async_session())
+
+    @classmethod
+    async def create_index(cls, keys, background=False, **kwargs):
+        """Creates the given indexes if required.
+
+        :param keys: a single index key or a list of index keys (to
+            construct a multi-field index); keys may be prefixed with a **+**
+            or a **-** to determine the index ordering
+        :param background: Allows index creation in the background
+        """
+        index_spec = cls._build_index_spec(keys)
+        index_spec = index_spec.copy()
+        fields = index_spec.pop("fields")
+        index_spec["background"] = background
+        index_spec.update(kwargs)
+
+        collection = await cls._get_async_collection()
+        return await collection.create_index(
+            fields, session=_get_async_session(), **index_spec
+        )
+
+    @classmethod
+    async def ensure_indexes(cls):
+        """Checks the document meta data and ensures all the indexes exist.
+
+        Global defaults can be set in the meta - see :doc:`guide/defining-documents`
+
+        By default, this will get called automatically upon first interaction with the
+        Document collection (query, save, etc) so unless you disabled `auto_create_index`, you
+        shouldn't have to call this manually.
+
+        This also gets called upon every call to Document.save if `auto_create_index_on_save` is set to True
+
+        If called multiple times, MongoDB will not re-recreate indexes if they exist already
+
+        .. note:: You can disable automatic index creation by setting
+                  `auto_create_index` to False in the documents meta data
+        """
+        background = cls._meta.get("index_background", False)
+        index_opts = cls._meta.get("index_opts") or {}
+        index_cls = cls._meta.get("index_cls", True)
+
+        collection = await cls._get_async_collection()
+
+        # determine if an index which we are creating includes
+        # _cls as its first field; if so, we can avoid creating
+        # an extra index on _cls, as mongodb will use the existing
+        # index to service queries against _cls
+        cls_indexed = False
+
+        # Ensure document-defined indexes are created
+        if cls._meta["index_specs"]:
+            index_spec = cls._meta["index_specs"]
+            for spec in index_spec:
+                spec = spec.copy()
+                fields = spec.pop("fields")
+                cls_indexed = cls_indexed or includes_cls(fields)
+                opts = index_opts.copy()
+                opts.update(spec)
+
+                # we shouldn't pass 'cls' to the collection.ensureIndex options
+                # because of https://jira.mongodb.org/browse/SERVER-769
+                if "cls" in opts:
+                    del opts["cls"]
+
+                await collection.create_index(
+                    fields, background=background, session=_get_async_session(), **opts
                 )
 
-        self._changed_fields = []
-        return self
+        # If _cls is being used (for polymorphism), it needs an index,
+        # only if another index doesn't begin with _cls
+        if index_cls and not cls_indexed and cls._meta.get("allow_inheritance"):
+            # we shouldn't pass 'cls' to the collection.ensureIndex options
+            # because of https://jira.mongodb.org/browse/SERVER-769
+            if "cls" in index_opts:
+                del index_opts["cls"]
 
-    async def modify(
-        self, query: Optional[Dict[str, Any]] = None, **update: Any
-    ) -> Optional["AsyncDocument"]:
-        """Modify and return the updated document asynchronously.
+            await collection.create_index(
+                "_cls",
+                background=background,
+                session=_get_async_session(),
+                **index_opts,
+            )
 
-        This performs an atomic find-and-modify operation.
+    @classmethod
+    async def list_indexes(cls):
+        """Lists all indexes that should be created for the Document collection.
+        It includes all the indexes from super- and sub-classes.
 
-        Args:
-            query: Additional query filters.
-            **update: Update operations.
-
-        Returns:
-            Updated document or None if no document matched.
+        Note that it will only return the indexes' fields, not the indexes' options
         """
-        if query:
-            for key, value in query.items():
-                if getattr(self, key, None) != value:
-                    return None
+        if cls._meta.get("abstract"):
+            return []
 
-        from mongoengine.queryset import transform
+        # get all the base classes, subclasses and siblings
+        classes = []
 
-        update_doc = transform.update(self.__class__, **update)
+        async def get_classes(cls):
+            if cls not in classes and isinstance(cls, TopLevelDocumentMetaclass):
+                classes.append(cls)
 
-        collection = await self._get_async_collection()
+            for base_cls in cls.__bases__:
+                if (
+                    isinstance(base_cls, TopLevelDocumentMetaclass)
+                    and base_cls != AsyncDocument
+                    and not base_cls._meta.get("abstract")
+                ):
+                    base_coll = await base_cls._get_async_collection()
+                    cls_coll = await cls._get_async_collection()
+                    if (
+                        base_coll.full_name == cls_coll.full_name
+                        and base_cls not in classes
+                    ):
+                        classes.append(base_cls)
+                        await get_classes(base_cls)
+            for subclass in cls.__subclasses__():
+                if isinstance(subclass, TopLevelDocumentMetaclass):
+                    sub_coll = await subclass._get_async_collection()
+                    cls_coll = await cls._get_async_collection()
+                    if (
+                        sub_coll.full_name == cls_coll.full_name
+                        and subclass not in classes
+                    ):
+                        classes.append(subclass)
+                        await get_classes(subclass)
 
-        result = await self._io.find_one_and_update(
-            collection,
-            {"_id": self.pk},
-            update_doc,
-            return_document=True,
-            session=_get_async_session(),
-        )
+        await get_classes(cls)
 
-        if result:
-            for field_name in self._fields_ordered:
-                if field_name in result:
-                    setattr(
-                        self,
-                        field_name,
-                        self._fields[field_name].to_python(result[field_name]),
-                    )
-            self._changed_fields = []
+        # get the indexes spec for all the gathered classes
+        def get_indexes_spec(cls):
+            indexes = []
 
-        return self
+            if cls._meta["index_specs"]:
+                index_spec = cls._meta["index_specs"]
+                for spec in index_spec:
+                    spec = spec.copy()
+                    fields = spec.pop("fields")
+                    indexes.append(fields)
+            return indexes
+
+        indexes = []
+        for klass in classes:
+            for index in get_indexes_spec(klass):
+                if index not in indexes:
+                    indexes.append(index)
+
+        # finish up by appending { '_id': 1 } and { '_cls': 1 }, if needed
+        if [("_id", 1)] not in indexes:
+            indexes.append([("_id", 1)])
+        if cls._meta.get("index_cls", True) and cls._meta.get("allow_inheritance"):
+            indexes.append([("_cls", 1)])
+
+        return indexes
+
+    @classmethod
+    async def compare_indexes(cls):
+        """Compares the indexes defined in MongoEngine with the ones
+        existing in the database. Returns any missing/extra indexes.
+        """
+
+        required = await cls.list_indexes()
+
+        existing = []
+        collection = await cls._get_async_collection()
+        index_info = await collection.index_information(session=_get_async_session())
+        for info in index_info.values():
+            if "_fts" in info["key"][0]:
+                # Useful for text indexes (but not only)
+                index_type = info["key"][0][1]
+                text_index_fields = info.get("weights").keys()
+                # Use NonOrderedList to avoid order comparison, see #2612
+                existing.append(
+                    NonOrderedList([(key, index_type) for key in text_index_fields])
+                )
+            else:
+                existing.append(info["key"])
+
+        missing = [index for index in required if index not in existing]
+        extra = [index for index in existing if index not in required]
+
+        # if { _cls: 1 } is missing, make sure it's *really* necessary
+        if [("_cls", 1)] in missing:
+            cls_obsolete = False
+            for index in existing:
+                if includes_cls(index) and index not in extra:
+                    cls_obsolete = True
+                    break
+            if cls_obsolete:
+                missing.remove([("_cls", 1)])
+
+        return {"missing": missing, "extra": extra}
 
 
-# Make it available at module level
-__all__ = ["AsyncDocument"]
+class AsyncDynamicDocument(AsyncDocument, metaclass=TopLevelDocumentMetaclass):
+    """An Async Dynamic Document class allowing flexible, expandable and uncontrolled
+    schemas.  As a :class:`~mongoengine.AsyncDocument` subclass, acts in the same
+    way as an ordinary async document but has expanded style properties.  Any data
+    passed or set against the :class:`~mongoengine.AsyncDynamicDocument` that is
+    not a field is automatically converted into a
+    :class:`~mongoengine.fields.DynamicField` and data can be attributed to that
+    field.
+
+    .. note::
+
+        There is one caveat on Dynamic Documents: undeclared fields cannot start with `_`
+    """
+
+    # my_metaclass is defined so that metaclass can be queried in Python 2 & 3
+    my_metaclass = TopLevelDocumentMetaclass
+
+    _dynamic = True
+
+    def __delattr__(self, *args, **kwargs):
+        """Delete the attribute by setting to None and allowing _delta
+        to unset it.
+        """
+        field_name = args[0]
+        if field_name in self._dynamic_fields:
+            setattr(self, field_name, None)
+            self._dynamic_fields[field_name].null = False
+        else:
+            super().__delattr__(*args, **kwargs)

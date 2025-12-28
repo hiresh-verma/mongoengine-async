@@ -16,11 +16,11 @@ from mongoengine.io.aio.connection import (
 from mongoengine.io.aio.operations import AsyncIOOperations
 
 __all__ = [
-    'AsyncIOOperations',
-    'async_connect',
-    'async_disconnect',
-    'async_disconnect_all',
-    'async_get_connection',
-    'async_get_db',
-    'async_register_connection',
+    "AsyncIOOperations",
+    "async_connect",
+    "async_disconnect",
+    "async_disconnect_all",
+    "async_get_connection",
+    "async_get_db",
+    "async_register_connection",
 ]
