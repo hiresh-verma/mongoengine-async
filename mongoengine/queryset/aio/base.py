@@ -1,44 +1,19 @@
 import copy
-import itertools
-import re
-import warnings
-from collections.abc import Mapping
 
-import pymongo
-import pymongo.errors
-from bson import SON, json_util
-from bson.code import Code
-from pymongo.collection import ReturnDocument
-from pymongo.common import validate_read_preference
-from pymongo.read_concern import ReadConcern
+from bson import SON
 
-from mongoengine import signals
-from mongoengine.base import _DocumentRegistry
-from mongoengine.common import _import_class
-from mongoengine.connection import _get_session, get_db
-from mongoengine.context_managers import (
-    no_dereferencing_active_for_class,
-    set_read_write_concern,
-    set_write_concern,
-    switch_db,
-)
-from mongoengine.io.sync.operations import SyncIOOperations
+from mongoengine.io.aio.connection import _get_async_session
+from mongoengine.io.aio.operations import AsyncIOOperations
+from mongoengine.context_managers import no_dereferencing_active_for_class
 from mongoengine.errors import (
-    BulkWriteError,
     InvalidQueryError,
-    LookUpError,
-    NotUniqueError,
     OperationError,
 )
-from mongoengine.pymongo_support import (
-    LEGACY_JSON_OPTIONS,
-    count_documents,
-)
-from mongoengine.queryset import transform
+
 from mongoengine.queryset.field_list import QueryFieldList
 from mongoengine.queryset.visitor import Q, QNode
 
-__all__ = ("BaseQuerySet", "DO_NOTHING", "NULLIFY", "CASCADE", "DENY", "PULL")
+__all__ = ("AsyncBaseQuerySet", "DO_NOTHING", "NULLIFY", "CASCADE", "DENY", "PULL")
 
 # Delete rules
 DO_NOTHING = 0
@@ -48,13 +23,15 @@ DENY = 3
 PULL = 4
 
 
-class BaseQuerySet:
+class AsyncBaseQuerySet:
     """A set of results returned from a query. Wraps a MongoDB cursor,
     providing :class:`~mongoengine.Document` objects as the results.
+
+    This is the async version that uses AsyncIOOperations.
     """
 
-    # I/O operations layer - can be swapped for async version
-    _io = SyncIOOperations
+    # I/O operations layer - async version
+    _io = AsyncIOOperations
 
     def __init__(self, document, collection):
         self._document = document
@@ -212,17 +189,25 @@ class BaseQuerySet:
 
         raise TypeError("Provide a slice or an integer index")
 
-    def __iter__(self):
-        raise NotImplementedError
+    def __aiter__(self):
+        """Return async iterator for the queryset."""
+        self._iter = True
+        return self
 
-    def _has_data(self):
+    async def _has_data(self):
         """Return True if cursor has any data."""
         queryset = self.order_by()
-        return False if queryset.first() is None else True
+        return False if await queryset.first() is None else True
 
     def __bool__(self):
-        """Avoid to open all records in an if stmt in Py3."""
-        return self._has_data()
+        """Avoid to open all records in an if stmt in Py3.
+
+        Note: Cannot call async _has_data() from __bool__.
+        For async check, use: if await queryset._has_data()
+        """
+        # For sync bool check, we assume queryset with no _none/_empty flags is truthy
+        # This is not perfect but __bool__ cannot be async
+        return not (self._none or self._empty)
 
     # Core functions
 
@@ -263,7 +248,7 @@ class BaseQuerySet:
 
         return queryset
 
-    def get(self, *q_objs, **query):
+    async def get(self, *q_objs, **query):
         """Retrieve the matching object raising
         :class:`~mongoengine.queryset.MultipleObjectsReturned` or
         `DocumentName.MultipleObjectsReturned` exception if multiple results
@@ -274,16 +259,32 @@ class BaseQuerySet:
         queryset = queryset.order_by().limit(2)
         queryset = queryset.filter(*q_objs, **query)
 
+        cursor = await queryset._get_cursor()
+
         try:
-            result = next(queryset)
-        except StopIteration:
+            first_doc = await cursor.__anext__()
+        except StopAsyncIteration:
             msg = "%s matching query does not exist." % queryset._document._class_name
             raise queryset._document.DoesNotExist(msg)
 
+        # Process first doc
+        if queryset._scalar:
+            result = queryset._get_scalar(
+                queryset._document._from_son(
+                    first_doc, _auto_dereference=self._auto_dereference
+                )
+            )
+        elif queryset._as_pymongo:
+            result = first_doc
+        else:
+            result = queryset._document._from_son(
+                first_doc, _auto_dereference=self._auto_dereference
+            )
+
         try:
             # Check if there is another match
-            next(queryset)
-        except StopIteration:
+            await cursor.__anext__()
+        except StopAsyncIteration:
             return result
 
         # If we were able to retrieve a 2nd doc, raise the MultipleObjectsReturned exception.
@@ -295,19 +296,33 @@ class BaseQuerySet:
         """Create new object. Returns the saved object instance."""
         return self._document(**kwargs).save(force_insert=True)
 
-    def first(self):
+    async def first(self):
         """Retrieve the first object matching the query."""
-        queryset = self.clone()
         if self._none or self._empty:
             return None
 
-        try:
-            result = queryset[0]
-        except IndexError:
-            result = None
-        return result
+        queryset = self.clone().limit(1)
+        cursor = await queryset._get_cursor()
 
-    def insert(
+        try:
+            doc = await cursor.__anext__()
+            if queryset._scalar:
+                return queryset._get_scalar(
+                    queryset._document._from_son(
+                        doc,
+                        _auto_dereference=self._auto_dereference,
+                    )
+                )
+            if queryset._as_pymongo:
+                return doc
+            return queryset._document._from_son(
+                doc,
+                _auto_dereference=self._auto_dereference,
+            )
+        except StopAsyncIteration:
+            return None
+
+    async def insert(
         self, doc_or_docs, load_bulk=True, write_concern=None, signal_kwargs=None
     ):
         """bulk insert documents
@@ -357,14 +372,15 @@ class BaseQuerySet:
         with set_write_concern(self._collection, write_concern) as collection:
             pass
 
+        session = _get_async_session()
         try:
             if return_one:
-                inserted_result = self._io.insert_one(
-                    collection, raw[0], session=_get_session()
+                inserted_result = await self._io.insert_one(
+                    collection, raw[0], session=session
                 )
             else:
-                inserted_result = self._io.insert_many(
-                    collection, raw, session=_get_session()
+                inserted_result = await self._io.insert_many(
+                    collection, raw, session=session
                 )
             ids = (
                 [inserted_result.inserted_id]
@@ -398,14 +414,14 @@ class BaseQuerySet:
             )
             return ids[0] if return_one else ids
 
-        documents = self.in_bulk(ids)
+        documents = await self.in_bulk(ids)
         results = [documents.get(obj_id) for obj_id in ids]
         signals.post_bulk_insert.send(
             self._document, documents=results, loaded=True, **signal_kwargs
         )
         return results[0] if return_one else results
 
-    def count(self, with_limit_and_skip=False):
+    async def count(self, with_limit_and_skip=False):
         """Count the selected elements in the query.
 
         :param with_limit_and_skip (optional): take any :meth:`limit` or
@@ -436,8 +452,9 @@ class BaseQuerySet:
         if self._collation:
             kwargs["collation"] = self._collation
 
-        count = count_documents(
-            collection=self._cursor.collection,
+        cursor = await self._get_cursor()
+        count = await async_count_documents(
+            collection=cursor.collection,
             filter=self._query,
             **kwargs,
         )
@@ -445,7 +462,9 @@ class BaseQuerySet:
         self._cursor_obj = None
         return count
 
-    def delete(self, write_concern=None, _from_doc_delete=False, cascade_refs=None):
+    async def delete(
+        self, write_concern=None, _from_doc_delete=False, cascade_refs=None
+    ):
         """Delete the documents matched by the query.
 
         :param write_concern: Extra keyword arguments are passed down which
@@ -478,8 +497,8 @@ class BaseQuerySet:
 
         if call_document_delete:
             cnt = 0
-            for doc in queryset:
-                doc.delete(**write_concern)
+            async for doc in queryset:
+                await doc.delete(**write_concern)
                 cnt += 1
             return cnt
 
@@ -495,7 +514,7 @@ class BaseQuerySet:
 
             if rule == DENY:
                 refs = document_cls.objects(**{field_name + "__in": self})
-                if refs.limit(1).count() > 0:
+                if await refs.limit(1).count() > 0:
                     raise OperationError(
                         "Could not delete document (%s.%s refers to it)"
                         % (document_cls.__name__, field_name)
@@ -511,19 +530,21 @@ class BaseQuerySet:
                 cascade_refs = set() if cascade_refs is None else cascade_refs
                 # Handle recursive reference
                 if doc._collection == document_cls._collection:
-                    for ref in queryset:
+                    async for ref in queryset:
                         cascade_refs.add(ref.id)
                 refs = document_cls.objects(
                     **{field_name + "__in": self, "pk__nin": cascade_refs}
                 )
-                if refs.count() > 0:
-                    refs.delete(write_concern=write_concern, cascade_refs=cascade_refs)
+                if await refs.count() > 0:
+                    await refs.delete(
+                        write_concern=write_concern, cascade_refs=cascade_refs
+                    )
             elif rule == NULLIFY:
-                document_cls.objects(**{field_name + "__in": self}).update(
+                await document_cls.objects(**{field_name + "__in": self}).update(
                     write_concern=write_concern, **{"unset__%s" % field_name: 1}
                 )
             elif rule == PULL:
-                document_cls.objects(**{field_name + "__in": self}).update(
+                await document_cls.objects(**{field_name + "__in": self}).update(
                     write_concern=write_concern, **{"pull_all__%s" % field_name: self}
                 )
 
@@ -535,11 +556,12 @@ class BaseQuerySet:
         if self._comment:
             kwargs["comment"] = self._comment
 
+        session = _get_async_session()
         with set_write_concern(queryset._collection, write_concern) as collection:
-            result = self._io.delete_many(
+            result = await self._io.delete_many(
                 collection,
                 queryset._query,
-                session=_get_session(),
+                session=session,
                 **kwargs,
             )
 
@@ -549,7 +571,7 @@ class BaseQuerySet:
             if result.acknowledged:
                 return result.deleted_count
 
-    def update(
+    async def update(
         self,
         upsert=False,
         multi=True,
@@ -612,27 +634,28 @@ class BaseQuerySet:
         if self._comment:
             kwargs["comment"] = self._comment
 
+        session = _get_async_session()
         try:
             with set_read_write_concern(
                 queryset._collection, write_concern, read_concern
             ) as collection:
                 if multi:
-                    result = self._io.update_many(
+                    result = await self._io.update_many(
                         collection,
                         query,
                         update,
                         upsert=upsert,
-                        session=_get_session(),
+                        session=session,
                         array_filters=array_filters,
                         **kwargs,
                     )
                 else:
-                    result = self._io.update_one(
+                    result = await self._io.update_one(
                         collection,
                         query,
                         update,
                         upsert=upsert,
-                        session=_get_session(),
+                        session=session,
                         array_filters=array_filters,
                         **kwargs,
                     )
@@ -648,7 +671,7 @@ class BaseQuerySet:
                 raise OperationError(message)
             raise OperationError("Update failed (%s)" % err)
 
-    def upsert_one(self, write_concern=None, read_concern=None, **update):
+    async def upsert_one(self, write_concern=None, read_concern=None, **update):
         """Overwrite or add the first document matched by the query.
 
         :param write_concern: Extra keyword arguments are passed down which
@@ -663,7 +686,7 @@ class BaseQuerySet:
         :returns the new or overwritten document
         """
 
-        atomic_update = self.update(
+        atomic_update = await self.update(
             multi=False,
             upsert=True,
             write_concern=write_concern,
@@ -673,12 +696,12 @@ class BaseQuerySet:
         )
 
         if atomic_update.raw_result["updatedExisting"]:
-            document = self.get()
+            document = await self.get()
         else:
-            document = self._document.objects.with_id(atomic_update.upserted_id)
+            document = await self._document.objects.with_id(atomic_update.upserted_id)
         return document
 
-    def update_one(
+    async def update_one(
         self,
         upsert=False,
         write_concern=None,
@@ -703,7 +726,7 @@ class BaseQuerySet:
             full_result
         :returns the number of updated documents (unless ``full_result`` is True)
         """
-        return self.update(
+        return await self.update(
             upsert=upsert,
             multi=False,
             write_concern=write_concern,
@@ -712,7 +735,7 @@ class BaseQuerySet:
             **update,
         )
 
-    def modify(
+    async def modify(
         self,
         upsert=False,
         remove=False,
@@ -754,13 +777,14 @@ class BaseQuerySet:
             update = transform.update(queryset._document, **update)
         sort = queryset._ordering
 
+        session = _get_async_session()
         try:
             if remove:
-                result = self._io.find_one_and_delete(
+                result = await self._io.find_one_and_delete(
                     queryset._collection,
                     query,
                     sort=sort,
-                    session=_get_session(),
+                    session=session,
                     **self._cursor_args,
                 )
             else:
@@ -768,14 +792,14 @@ class BaseQuerySet:
                     return_doc = ReturnDocument.AFTER
                 else:
                     return_doc = ReturnDocument.BEFORE
-                result = self._io.find_one_and_update(
+                result = await self._io.find_one_and_update(
                     queryset._collection,
                     query,
                     update,
                     upsert=upsert,
                     sort=sort,
                     return_document=return_doc,
-                    session=_get_session(),
+                    session=session,
                     array_filters=array_filters,
                     **self._cursor_args,
                 )
@@ -789,7 +813,7 @@ class BaseQuerySet:
 
         return result
 
-    def with_id(self, object_id):
+    async def with_id(self, object_id):
         """Retrieve the object matching the id provided.  Uses `object_id` only
         and raises InvalidQueryError if a filter has been applied. Returns
         `None` if no document exists with that id.
@@ -800,9 +824,9 @@ class BaseQuerySet:
         if queryset._query_obj:
             msg = "Cannot use a filter whilst using `with_id`"
             raise InvalidQueryError(msg)
-        return queryset.filter(pk=object_id).first()
+        return await queryset.filter(pk=object_id).first()
 
-    def in_bulk(self, object_ids):
+    async def in_bulk(self, object_ids):
         """Retrieve a set of documents by their ids.
 
         :param object_ids: a list or tuple of ObjectId's
@@ -811,20 +835,21 @@ class BaseQuerySet:
         """
         doc_map = {}
 
+        session = _get_async_session()
         docs = self._io.find(
             self._collection,
             {"_id": {"$in": object_ids}},
-            session=_get_session(),
+            session=session,
             **self._cursor_args,
         )
         if self._scalar:
-            for doc in docs:
+            async for doc in docs:
                 doc_map[doc["_id"]] = self._get_scalar(self._document._from_son(doc))
         elif self._as_pymongo:
-            for doc in docs:
+            async for doc in docs:
                 doc_map[doc["_id"]] = doc
         else:
-            for doc in docs:
+            async for doc in docs:
                 doc_map[doc["_id"]] = self._document._from_son(
                     doc,
                     _auto_dereference=self._auto_dereference,
@@ -871,9 +896,9 @@ class BaseQuerySet:
         a new queryset (which has to be an instance of
         :class:`~mongoengine.queryset.base.BaseQuerySet`).
         """
-        if not isinstance(new_qs, BaseQuerySet):
+        if not isinstance(new_qs, AsyncBaseQuerySet):
             raise OperationError(
-                "%s is not a subclass of BaseQuerySet" % new_qs.__name__
+                "%s is not a subclass of AsyncBaseQuerySet" % new_qs.__name__
             )
 
         copy_props = (
@@ -908,14 +933,14 @@ class BaseQuerySet:
             val = getattr(self, prop)
             setattr(new_qs, prop, copy.copy(val))
 
-        new_qs.__auto_dereference = self._BaseQuerySet__auto_dereference
+        new_qs._AsyncBaseQuerySet__auto_dereference = self._AsyncBaseQuerySet__auto_dereference
 
         if self._cursor_obj:
             new_qs._cursor_obj = self._cursor_obj.clone()
 
         return new_qs
 
-    def select_related(self, max_depth=1):
+    async def select_related(self, max_depth=1):
         """Handles dereferencing of :class:`~bson.dbref.DBRef` objects or
         :class:`~bson.object_id.ObjectId` a maximum depth in order to cut down
         the number queries to mongodb.
@@ -923,7 +948,7 @@ class BaseQuerySet:
         # Make select related work the same for querysets
         max_depth += 1
         queryset = self.clone()
-        return queryset._dereference(queryset, max_depth=max_depth)
+        return await queryset._dereference(queryset, max_depth=max_depth)
 
     def limit(self, n):
         """Limit the number of returned documents to `n`. This may also be
@@ -1021,7 +1046,7 @@ class BaseQuerySet:
 
         return queryset
 
-    def distinct(self, field):
+    async def distinct(self, field):
         """Return a list of distinct values for a given field.
 
         :param field: the field to select distinct values from
@@ -1036,11 +1061,14 @@ class BaseQuerySet:
         except LookUpError:
             pass
 
-        raw_values = queryset._cursor.distinct(field)
+        cursor = await queryset._get_cursor()
+        raw_values = await cursor.distinct(field)
         if not self._auto_dereference:
             return raw_values
 
-        distinct = self._dereference(raw_values, 1, name=field, instance=self._document)
+        distinct = await self._dereference(
+            raw_values, 1, name=field, instance=self._document
+        )
 
         doc_field = self._document._fields.get(field.split(".", 1)[0])
         instance = None
@@ -1246,11 +1274,12 @@ class BaseQuerySet:
         """
         return self._chainable_method("comment", text)
 
-    def explain(self):
+    async def explain(self):
         """Return an explain plan record for the
         :class:`~mongoengine.queryset.QuerySet` cursor.
         """
-        return self._cursor.explain()
+        cursor = await self._get_cursor()
+        return cursor.explain()
 
     # DEPRECATED. Has no more impact on PyMongo 3+
     def snapshot(self, enabled):
@@ -1378,7 +1407,7 @@ class BaseQuerySet:
         son_data = json_util.loads(json_data)
         return [self._document._from_son(data) for data in son_data]
 
-    def aggregate(self, pipeline, **kwargs):
+    async def aggregate(self, pipeline, **kwargs):
         """Perform an aggregate function based on your queryset params
 
         If the queryset contains a query or skip/limit/sort or if the target Document class
@@ -1446,16 +1475,17 @@ class BaseQuerySet:
         if self._comment:
             kwargs.setdefault("comment", self._comment)
 
+        session = _get_async_session()
         return self._io.aggregate(
             collection,
             final_pipeline,
             cursor={},
-            session=_get_session(),
+            session=session,
             **kwargs,
         )
 
     # JS functionality
-    def map_reduce(
+    async def map_reduce(
         self, map_f, reduce_f, output, finalize_f=None, limit=None, scope=None
     ):
         """Perform a map/reduce query using the current query spec
@@ -1551,7 +1581,8 @@ class BaseQuerySet:
                 mr_args["out"] = SON(ordered_output)
 
         db = queryset._document._get_db()
-        result = self._io.command(
+        session = _get_async_session()
+        result = await self._io.command(
             db,
             {
                 "mapReduce": queryset._document._get_collection_name(),
@@ -1559,7 +1590,7 @@ class BaseQuerySet:
                 "reduce": reduce_f,
                 **mr_args,
             },
-            session=_get_session(),
+            session=session,
         )
 
         if inline:
@@ -1574,12 +1605,12 @@ class BaseQuerySet:
         if queryset._ordering:
             docs = docs.sort(queryset._ordering)
 
-        for doc in docs:
+        async for doc in docs:
             yield MapReduceDocument(
                 queryset._document, queryset._collection, doc["_id"], doc["value"]
             )
 
-    def exec_js(self, code, *fields, **options):
+    async def exec_js(self, code, *fields, **options):
         """Execute a Javascript function on the server. A list of fields may be
         provided, which will be translated to their correct names and supplied
         as the arguments to the function. A few extra variables are added to
@@ -1618,7 +1649,8 @@ class BaseQuerySet:
         code = Code(code, scope=scope)
 
         db = queryset._document._get_db()
-        return db.command("eval", code, args=fields).get("retval")
+        result = await db.command("eval", code, args=fields)
+        return result.get("retval")
 
     def where(self, where_clause):
         """Filter ``QuerySet`` results with a ``$where`` clause (a Javascript
@@ -1634,7 +1666,7 @@ class BaseQuerySet:
         queryset._where_clause = where_clause
         return queryset
 
-    def sum(self, field):
+    async def sum(self, field):
         """Sum over the values of the specified field.
 
         :param field: the field to sum over; use dot notation to refer to
@@ -1654,17 +1686,19 @@ class BaseQuerySet:
         if isinstance(field_instances[-1], ListField):
             pipeline.insert(1, {"$unwind": "$" + field})
 
-        result = tuple(
-            self._io.aggregate(
-                self._document._get_collection(), pipeline, session=_get_session()
-            )
+        session = _get_async_session()
+        cursor = self._io.aggregate(
+            self._document._get_collection(), pipeline, session=session
         )
+        result = []
+        async for doc in cursor:
+            result.append(doc)
 
         if result:
             return result[0]["total"]
         return 0
 
-    def average(self, field):
+    async def average(self, field):
         """Average over the values of the specified field.
 
         :param field: the field to average over; use dot notation to refer to
@@ -1685,11 +1719,14 @@ class BaseQuerySet:
         if isinstance(field_instances[-1], ListField):
             pipeline.insert(1, {"$unwind": "$" + field})
 
-        result = tuple(
-            self._io.aggregate(
-                self._document._get_collection(), pipeline, session=_get_session()
-            )
+        session = _get_async_session()
+        cursor = self._io.aggregate(
+            self._document._get_collection(), pipeline, session=session
         )
+        result = []
+        async for doc in cursor:
+            result.append(doc)
+
         if result:
             return result[0]["total"]
         return 0
@@ -1719,12 +1756,16 @@ class BaseQuerySet:
 
     # Iterator helpers
 
-    def __next__(self):
+    async def __anext__(self):
         """Wrap the result in a :class:`~mongoengine.Document` object."""
         if self._none or self._empty:
-            raise StopIteration
+            raise StopAsyncIteration
 
-        raw_doc = next(self._cursor)
+        cursor = await self._get_cursor()
+        try:
+            raw_doc = await cursor.__anext__()
+        except StopAsyncIteration:
+            raise
 
         if self._as_pymongo:
             return raw_doc
@@ -1739,10 +1780,11 @@ class BaseQuerySet:
 
         return doc
 
-    def rewind(self):
+    async def rewind(self):
         """Rewind the cursor to its unevaluated state."""
         self._iter = False
-        self._cursor.rewind()
+        cursor = await self._get_cursor()
+        cursor.rewind()
 
     # Properties
 
@@ -1781,8 +1823,7 @@ class BaseQuerySet:
 
         return cursor_args
 
-    @property
-    def _cursor(self):
+    async def _get_cursor(self):
         """Return a PyMongo cursor object corresponding to this queryset."""
 
         # If _cursor_obj already exists, return it immediately.
@@ -1793,16 +1834,20 @@ class BaseQuerySet:
         # XXX In PyMongo 3+, we define the read preference on a collection
         # level, not a cursor level. Thus, we need to get a cloned collection
         # object using `with_options` first.
+        session = _get_async_session()
         if self._read_preference is not None or self._read_concern is not None:
             collection = self._collection.with_options(
                 read_preference=self._read_preference, read_concern=self._read_concern
             )
             self._cursor_obj = self._io.find(
-                collection, self._query, session=_get_session(), **self._cursor_args
+                collection, self._query, session=session, **self._cursor_args
             )
         else:
             self._cursor_obj = self._io.find(
-                self._collection, self._query, session=_get_session(), **self._cursor_args
+                self._collection,
+                self._query,
+                session=session,
+                **self._cursor_args,
             )
 
         # Apply "where" clauses to cursor
@@ -1863,7 +1908,7 @@ class BaseQuerySet:
     @property
     def _dereference(self):
         if not self.__dereference:
-            self.__dereference = _import_class("DeReference")()
+            self.__dereference = AsyncDeReference()
         return self.__dereference
 
     @property
@@ -2104,14 +2149,14 @@ class BaseQuerySet:
         code = re.sub(r"\{\{\s*~([A-z_][A-z_0-9.]+?)\s*\}\}", field_path_sub, code)
         return code
 
-    def _chainable_method(self, method_name, val):
+    async def _chainable_method(self, method_name, val):
         """Call a particular method on the PyMongo cursor call a particular chainable method
         with the provided value.
         """
         queryset = self.clone()
 
         # Get an existing cursor object or create a new one
-        cursor = queryset._cursor
+        cursor = await queryset._get_cursor()
 
         # Find the requested method on the cursor and call it with the
         # provided value
